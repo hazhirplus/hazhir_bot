@@ -297,6 +297,15 @@ python -m pytest tests/ -q
 | `throttle.py` | محدودیت نرخ پیام (ضد اسپم) |
 | `keyboards.py` / `text.py` / `helpers.py` | منوها، متن‌ها و ابزارهای مشترک |
 
+### ☕ حمایت مالی (Buy me a coffee)
+
+اگر این ربات به کارت اومد و خواستی از توسعه‌اش حمایت کنی، می‌تونی با ارز دیجیتال دونیت کنی:
+
+**آدرس EVM (اتریوم / Base / آربیتروم / اپتیمیزم):**
+`0x92A8F1fe99D30b11D602e3f8A8078d125a158f7E`
+
+ETH و USDC روی همین شبکه‌ها قابل ارسال است. ممنون! ☕
+
 ### لایسنس
 
 AGPL-3.0 — فایل `LICENSE` را ببینید.
@@ -584,6 +593,15 @@ Tests use only temporary SQLite databases and never touch a real panel or Telegr
 | `chainwatch.py` | On-chain crypto payment verification (optional) |
 | `throttle.py` | Message rate limiting (anti-flood) |
 | `keyboards.py` / `text.py` / `helpers.py` | Menus, texts and shared helpers |
+
+### ☕ Buy me a coffee (Donate)
+
+If this bot was useful to you and you'd like to support its development, you can donate with crypto:
+
+**EVM address (Ethereum / Base / Arbitrum / Optimism):**
+`0x92A8F1fe99D30b11D602e3f8A8078d125a158f7E`
+
+ETH and USDC on these networks are accepted. Thank you! ☕
 
 ### License
 
