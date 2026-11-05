@@ -117,7 +117,27 @@ A Persian Telegram bot for selling VPN subscriptions via a **3x-ui** panel — p
    (بدون این، ربات با خطای `Missing required environment variable` کرش می‌کند.)
 7. **Redeploy** کن و در **Console** دنبال لاگ شروع باش. اگر خطایی نبود، ربات بالاست.
 
-#### قدم ۵ — دیپلوی روی سرور مجازی (VPS با Ubuntu)
+#### قدم ۵ — دیپلوی روی سرور مجازی (VPS) — با یک دستور
+
+روی سرور (Ubuntu / Debian) فقط این یک دستور را بزنید:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hazhirplus/hazhir_bot/main/install.sh | bash
+```
+
+نصب‌کننده (`install.sh`) این کارها را می‌کند:
+1. پیش‌نیازها را نصب می‌کند (Python 3.11+ ،venv ،git)
+2. کد را می‌گیرد و محیط مجازی می‌سازد و وابستگی‌ها را نصب می‌کند
+3. همان‌جا در ترمینال از شما می‌پرسد:
+   - **توکن ربات** (از BotFather — قدم ۱)
+   - **آیدی عددی تلگرام شما** (از @userinfobot — قدم ۲)
+4. فقط همین دو مقدار را در فایل `.env` می‌نویسد و ربات را به‌صورت سرویس systemd بالا می‌آورد
+
+بقیه‌ی تنظیمات (آدرس پنل، توکن API، لینک ساب، اینباندها، کارت بانکی، پلن‌ها) بعد از بالا آمدن ربات، **از داخل خود ربات** انجام می‌شود — قدم ۷. نیازی به ویرایش دستی هیچ فایلی نیست.
+
+> اگر نصب‌کننده کار نکرد، روش دستی پایین را ببینید.
+
+#### قدم ۵ (روش دستی) — دیپلوی روی سرور مجازی (VPS با Ubuntu)
 
 1. **نصب Python و git** (روی Ubuntu 24.04 پایتون ۳٫۱۲ از پیش نصب است؛ روی 22.04 اول پایتون ۳٫۱۲ را از PPA deadsnakes نصب کن):
    ```bash
@@ -205,6 +225,8 @@ A Persian Telegram bot for selling VPN subscriptions via a **3x-ui** panel — p
 
 #### قدم ۷ — اولین ورود و بررسی سلامت
 
+همه‌ی تنظیمات پنل از داخل خود ربات انجام می‌شود — نیازی به ویرایش فایل نیست.
+
 1. در تلگرام رباتت را `/start` بزن — منوی مشتری را می‌بینی.
 2. دکمه‌ی **🛠 مدیریت** را در منوی پایین بزن — پنل مدیریت باز می‌شود.
 3. به «🖥 پنل‌ها» ← «🔌 تست اتصال» برو — باید ✅ بدهد. اگر ❌ داد، جدول عیب‌یابی پایین را ببین.
@@ -287,6 +309,7 @@ python -m pytest tests/ -q
 | فایل | توضیح |
 |---|---|
 | `main.py` | نقطه ورود؛ ساخت اپلیکیشن، ثبت هندلرها و جاب‌ها |
+| `install.sh` | نصب‌کننده‌ی یک‌خطی (پیش‌نیازها + گرفتن توکن و آیدی در ترمینال + سرویس systemd) |
 | `config.py` | خواندن تنظیمات فقط از متغیر محیطی |
 | `db.py` | SQLite (aiosqlite)؛ کاربران، فاکتورها، پلن‌ها، تنظیمات |
 | `panel.py` | کلاینت API پنل 3x-ui (ساخت/حذف/ترافیک/لینک ساب) |
@@ -414,7 +437,27 @@ Hazhir VPN Bot is a Telegram bot that sells VPN subscriptions through your **3x-
    (Without this, the bot crashes with `Missing required environment variable`.)
 7. **Redeploy** and watch the **Console** for the startup log. If there is no error, the bot is up.
 
-#### Step 5 — Deploy on a VPS (Ubuntu)
+#### Step 5 — Deploy on a VPS — with one command
+
+On your server (Ubuntu / Debian), just run this one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hazhirplus/hazhir_bot/main/install.sh | bash
+```
+
+The installer (`install.sh`) does this:
+1. Installs the prerequisites (Python 3.11+, venv, git)
+2. Fetches the code, creates a virtual environment and installs dependencies
+3. Asks you right there in the terminal for:
+   - **Bot token** (from BotFather — step 1)
+   - **Your numeric Telegram ID** (from @userinfobot — step 2)
+4. Writes only those two values to the `.env` file and starts the bot as a systemd service
+
+All other settings (panel address, API token, sub-link, inbounds, bank card, plans) are configured afterwards **from inside the bot itself** — step 7. No manual file editing needed.
+
+> If the installer doesn't work for you, see the manual method below.
+
+#### Step 5 (manual method) — Deploy on a VPS (Ubuntu)
 
 1. **Install Python and git** (Ubuntu 24.04 ships Python 3.12; on 22.04 install Python 3.12 from the deadsnakes PPA first):
    ```bash
@@ -502,6 +545,8 @@ Any Linux server (or even macOS/Windows) with **Python 3.11+** is enough:
 
 #### Step 7 — First login and health check
 
+All panel settings are configured from inside the bot itself — no file editing needed.
+
 1. Send `/start` to your bot in Telegram — you see the customer menu.
 2. Tap the **🛠 management** button in the bottom menu — the admin panel opens.
 3. Go to "🖥 Panels" → "🔌 Test connection" — it should return ✅. If it returns ❌, see the troubleshooting table below.
@@ -584,6 +629,7 @@ Tests use only temporary SQLite databases and never touch a real panel or Telegr
 | File | Description |
 |---|---|
 | `main.py` | Entry point; builds the app, registers handlers and jobs |
+| `install.sh` | One-command installer (prerequisites + token and ID prompts + systemd service) |
 | `config.py` | Configuration read only from environment variables |
 | `db.py` | SQLite (aiosqlite); users, invoices, plans, settings |
 | `panel.py` | 3x-ui panel API client (create/delete/traffic/sub-links) |
