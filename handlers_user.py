@@ -664,6 +664,9 @@ async def send_service_card(target, context, inv: dict, edit: bool = False) -> N
                     days_left = "نامحدود"
             else:
                 status_fa = "⚠️ در پنل یافت نشد"
+        except PanelError as e:
+            status_fa = ("⚠️ در پنل یافت نشد" if e.is_not_found
+                         else "⚠️ خطا در خواندن وضعیت")
         except Exception as e:
             log.warning("service status failed: %s", e)
             status_fa = "⚠️ خطا در خواندن وضعیت"

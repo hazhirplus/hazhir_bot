@@ -230,8 +230,16 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
     now = int(time.time())
     try:
         if inv["kind"] == "renew" and inv.get("panel_email"):
-            # extend existing client
-            client = await pc.get_client(inv["panel_email"])
+            # extend existing client; a client deleted from the panel
+            # (get_client raises not-found) is recreated fresh instead
+            # of failing the paid renewal
+            try:
+                client = await pc.get_client(inv["panel_email"])
+            except PanelError as e:
+                if e.is_not_found:
+                    client = None
+                else:
+                    raise
             if client:
                 cur_exp = client.get("expiryTime", 0) or 0
                 base_ms = max(cur_exp, now * 1000)
@@ -254,7 +262,8 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
         expires_at = max(inv["expires_at"], now) + days * 86400
     await db.update_invoice(inv["id"], status="active", panel_id=panel["id"],
                             panel_email=email, sub_id=sub_id,
-                            activated_at=now, expires_at=expires_at, warned_at=0)
+                            activated_at=now, expires_at=expires_at, warned_at=0,
+                            volume_warned_at=0)  # clear orphan marker on (re)activation
     await db.set_payment(inv["id"], "approved", admin_id)
     ok = await deliver_service(context, await db.get_invoice(inv["id"]))
     extra = "" if ok else "\n⚠️ ارسال لینک‌ها ناموفق بود — از «سرویس‌های من» دوباره بگیر."

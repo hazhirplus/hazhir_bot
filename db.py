@@ -572,7 +572,9 @@ async def due_for_volume_warn(path: str | None = None) -> list[dict]:
     """Active invoices never warned about volume, with a panel account.
 
     Volume itself lives on the panel (client.totalGB), so the caller checks
-    actual usage; this only narrows the candidates."""
+    actual usage; this only narrows the candidates. volume_warned_at=-1
+    marks an orphan (panel account gone) — excluded, see jobs.hourly_check.
+    """
     path = path or config.DB_PATH
     async with aiosqlite.connect(path) as con:
         con.row_factory = aiosqlite.Row

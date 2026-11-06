@@ -12,6 +12,7 @@ import db
 import text as T
 import keyboards as K
 from helpers import notify_admins, panel_client_for, volume_pct_used
+from panel import PanelError
 
 log = logging.getLogger("hozhir")
 TEHRAN = ZoneInfo("Asia/Tehran")
@@ -71,6 +72,7 @@ async def hourly_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         warn_pct = 80
     warn_pct = max(1, min(100, warn_pct))
+    orphans: list[dict] = []  # active invoices whose panel account is gone
     for inv in await db.due_for_volume_warn():
         panel = await db.get_panel(inv["panel_id"]) if inv.get("panel_id") \
             else await db.get_active_panel()
@@ -78,8 +80,19 @@ async def hourly_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         try:
             pc = panel_client_for(panel)
-            client = await pc.get_client(inv["panel_email"])
+            try:
+                client = await pc.get_client(inv["panel_email"])
+            except PanelError as e:
+                if e.is_not_found:
+                    client = None  # deleted from the panel: orphan
+                else:
+                    raise
             if not client:
+                # Mark volume_warned_at=-1 (sentinel: "panel record
+                # missing") so due_for_volume_warn() stops returning
+                # it every hour; the admin is told once, below.
+                await db.update_invoice(inv["id"], volume_warned_at=-1)
+                orphans.append(inv)
                 continue
             total = client.get("totalGB", 0) or 0
             if not total:
@@ -105,6 +118,16 @@ async def hourly_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("volume warn send failed: %s", e)
             continue  # don't mark warned: retry next hour
         await db.update_invoice(inv["id"], volume_warned_at=int(time.time()))
+    if orphans:
+        lines = "\n".join(
+            f"• فاکتور #{i['id']} — کاربر {i['user_id']} — {i['panel_email']}"
+            for i in orphans)
+        await notify_admins(
+            context,
+            "⚠️ سرویس‌هایی در پنل پیدا نشد:\n" + lines +
+            "\n\nاین سرویس‌ها فعال‌اند ولی اکانتشان از پنل حذف شده؛ "
+            "بررسی ساعتی حجم برایشان متوقف شد تا لاگ شلوغ نشود. "
+            "تمدیدشان به‌صورت خودکار اکانت تازه می‌سازد.")
     # 2) disable expired services on the panel
     for inv in await db.due_for_expire():
         panel = await db.get_panel(inv["panel_id"]) if inv.get("panel_id") \
@@ -113,7 +136,11 @@ async def hourly_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await panel_client_for(panel).set_enable(inv["panel_email"], False)
             except Exception as e:
-                log.warning("disable expired failed: %s", e)
+                if isinstance(e, PanelError) and e.is_not_found:
+                    log.info("disable expired #%s: already gone from panel",
+                             inv["id"])
+                else:
+                    log.warning("disable expired failed: %s", e)
         await db.update_invoice(inv["id"], status="expired")
         plan = await db.get_plan(inv["plan_id"]) if inv.get("plan_id") else None
         try:

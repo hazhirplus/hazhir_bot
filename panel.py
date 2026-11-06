@@ -21,6 +21,18 @@ class PanelError(Exception):
         super().__init__(message)
         self.code = code  # auth | notfound | timeout | unreachable | api | error
 
+    @property
+    def is_not_found(self) -> bool:
+        """True when the panel says the record does not exist.
+
+        3x-ui reports a missing client as success:false with
+        msg "Obtain (record not found)" (code "api"), or as HTTP 404
+        (code "notfound"). Either way the account is gone from the
+        panel, which callers must treat differently from a transient
+        failure: retrying every hour only spams the log.
+        """
+        return self.code == "notfound" or "not found" in str(self).lower()
+
 
 # ---------------- pure helpers (unit-testable) ----------------
 def days_to_ms(days: int) -> int:
