@@ -66,8 +66,8 @@ A Persian Telegram bot for selling VPN subscriptions via a **3x-ui** panel — p
 1. در تلگرام به **[@BotFather](https://t.me/BotFather)** برو و دستور `/newbot` را بفرست.
 2. یک **نام** برای ربات انتخاب کن (مثلاً «هژیر وی‌پی‌ان»).
 3. یک **یوزرنیم** بده که به `bot` ختم شود (مثلاً `hazhirvpnbot`).
-4. BotFather یک **توکن** می‌دهد شبیه این:
-   `123456789:AAEhBOweik6ad9r_QXMENQjcrGbqCrK7gI`
+4. BotFather یک **توکن** می‌دهد؛ شکلش این‌طوری است (فقط نمونه — توکن واقعی نیست):
+   `<BOT_TOKEN>`
    این توکن «رمز عبور» ربات توست — هرگز آن را برای کسی نفرست و در هیچ فایل عمومی (مثل گیت‌هاب) ننویس. اگر لو رفت، در BotFather با `/revoke` باطلش کن و توکن تازه بگیر.
 5. توکن را نگه دار؛ در قدم ۴ یا ۵ آن را در متغیر محیطی `BOT_TOKEN` می‌گذاری.
 
@@ -386,8 +386,8 @@ Hazhir VPN Bot is a Telegram bot that sells VPN subscriptions through your **3x-
 1. In Telegram, open **[@BotFather](https://t.me/BotFather)** and send `/newbot`.
 2. Pick a **name** for the bot (e.g. "Hazhir VPN").
 3. Pick a **username** ending in `bot` (e.g. `hazhirvpnbot`).
-4. BotFather gives you a **token** that looks like this:
-   `123456789:AAEhBOweik6ad9r_QXMENQjcrGbqCrK7gI`
+4. BotFather gives you a **token**; it looks like this (example only — not a real token):
+   `<BOT_TOKEN>`
    This token is your bot's password — never send it to anyone and never write it in any public file (like GitHub). If it leaks, revoke it in BotFather with `/revoke` and get a new one.
 5. Keep the token; you will put it in the `BOT_TOKEN` environment variable in step 4 or 5.
 
