@@ -482,7 +482,9 @@ async def user_service_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
                               callback_data=f"adm_users_dis:{iid}"),
          InlineKeyboardButton("✅ فعال در پنل",
                               callback_data=f"adm_users_en:{iid}")],
-        [InlineKeyboardButton("🗑 حذف از پنل", callback_data=f"adm_users_del:{iid}")],
+        [InlineKeyboardButton("🗑 حذف از پنل", callback_data=f"adm_users_del:{iid}"),
+         InlineKeyboardButton("🔄 تعویض لینک اشتراک",
+                              callback_data=f"adm_users_revoke:{iid}")],
         [InlineKeyboardButton("◀️ برگشت",
                               callback_data=f"adm_users_view:{inv['user_id']}")],
     ])
@@ -509,6 +511,29 @@ async def user_service_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.answer("پنل یافت نشد.", show_alert=True)
         return
     pc = panel_client_for(panel)
+    if action == "revoke":
+        # Admin-only (user decision 2026-11-06): rotate the customer's
+        # sub link when it leaked. The old link dies immediately, so the
+        # new link is re-delivered to the customer right away.
+        try:
+            new_sub = await pc.revoke_sub(inv["panel_email"])
+        except PanelError as e:
+            if e.is_not_found:
+                await q.answer("⚠️ سرویس در پنل یافت نشد — اول با تمدید، "
+                               "اکانت تازه بساز.", show_alert=True)
+            else:
+                await q.answer(f"خطای پنل: {e}", show_alert=True)
+            return
+        await db.update_invoice(inv["id"], sub_id=new_sub)
+        ok = await deliver_service(context, await db.get_invoice(iid))
+        await q.answer("✅ لینک اشتراک عوض شد.")
+        await q.message.reply_text(
+            f"🔄 لینک اشتراک فاکتور #{iid} عوض شد.\n"
+            + ("✅ لینک جدید برای مشتری ارسال شد."
+               if ok else
+               "⚠️ ارسال لینک جدید به مشتری ناموفق بود — "
+               "از «سرویس‌های من» دوباره بگیر."))
+        return
     try:
         if action == "dis":
             await pc.set_enable(inv["panel_email"], False)
@@ -1046,7 +1071,8 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             tgid=tgid)
         elif data.startswith("adm_users_dis:") or \
                 data.startswith("adm_users_en:") or \
-                data.startswith("adm_users_del:"):
+                data.startswith("adm_users_del:") or \
+                data.startswith("adm_users_revoke:"):
             await user_service_action(update, context)
         # tutorials
         elif data == "adm_tut_home":

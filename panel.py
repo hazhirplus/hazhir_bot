@@ -207,6 +207,19 @@ class PanelClient:
     async def set_enable(self, email: str, enable: bool) -> dict:
         return await self.update_client(email, {"enable": enable})
 
+    async def revoke_sub(self, email: str) -> str:
+        """Rotate the client's subscription id (mirzabot's revokeSub).
+
+        3x-ui has no dedicated revoke endpoint; the verified mechanism is
+        updateClient with a fresh 16-hex subId (REVIEW.md API cheat-sheet:
+        update/{email} accepts "subId?"). The old sub link stops working
+        immediately, so callers must re-deliver the new link to the user.
+        Returns the new subId.
+        """
+        new_sub = gen_subid()
+        await self.update_client(email, {"subId": new_sub})
+        return new_sub
+
     async def reset_traffic(self, email: str) -> dict:
         return await self._call("POST", f"/clients/resetTraffic/{email}", json=[])
 
