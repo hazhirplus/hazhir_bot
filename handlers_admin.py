@@ -2,7 +2,8 @@
 
 Sections: reports (adm_rep_), payments (adm_pay_), panels (adm_panel_),
 inbounds (adm_inb_), plans (adm_plan_), cards (adm_card_), users (adm_users_),
-tutorials (adm_tut_), broadcast (adm_bc_), settings (adm_set_).
+tutorials (adm_tut_), broadcast (adm_bc_), settings (adm_set_),
+setup guide (adm_setup_).
 """
 from __future__ import annotations
 import asyncio
@@ -20,8 +21,8 @@ import text as T
 import keyboards as K
 from helpers import (admin_only, notify_admins, deliver_service,
                      panel_client_for, create_panel_client,
-                     maybe_grant_referral_gift)
-from panel import PanelError, gb_to_bytes, days_to_ms
+                     maybe_grant_referral_gift, send_md)
+from panel import PanelError, gb_to_bytes, days_to_ms, extract_sub_id
 
 log = logging.getLogger("hozhir")
 
@@ -126,6 +127,7 @@ ADMIN_SECTIONS = {
     "📚 آموزش‌ها": "tutorials_menu",
     "📢 پیام همگانی": "broadcast_home",
     "⚙️ تنظیمات": "settings_menu",
+    "📖 آموزش راه‌اندازی": "setup_guide_home",
 }
 
 
@@ -186,7 +188,7 @@ async def pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         label = (f"🧾 فاکتور #{inv['id']} — {T.KIND_FA.get(inv['kind'], inv['kind'])}\n"
                  f"👤 {inv['user_id']} | 📦 {plan['name'] if plan else '—'} | "
                  f"💰 {T.fmt_price(inv['price_toman'])}")
-        kb = K.pay_decision_kb(inv["id"])
+        kb = K.pay_decision_kb(inv["id"], manual=(inv["kind"] != "topup"))
         if inv["receipt_file_id"] and not inv["receipt_file_id"].startswith("text:"):
             try:
                 await update.effective_message.reply_photo(
@@ -228,6 +230,7 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
     gb = plan["gb"] if plan else _to_float(await db.get_setting("test_gb", "2"), 2.0)
     pc = panel_client_for(panel)
     now = int(time.time())
+    skipped: list[int] = []
     try:
         if inv["kind"] == "renew" and inv.get("panel_email"):
             # extend existing client; a client deleted from the panel
@@ -250,9 +253,9 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
                     "expiryTime": new_exp, "totalGB": new_total, "enable": True})
                 email, sub_id = inv["panel_email"], inv["sub_id"]
             else:
-                email, sub_id = await create_panel_client(pc, panel, inv, days, gb, now)
+                email, sub_id, skipped = await create_panel_client(pc, panel, inv, days, gb, now)
         else:
-            email, sub_id = await create_panel_client(pc, panel, inv, days, gb, now)
+            email, sub_id, skipped = await create_panel_client(pc, panel, inv, days, gb, now)
     except PanelError as e:
         log.warning("panel op failed: %s", e)
         return f"⚠️ خطای پنل: {e}"
@@ -267,6 +270,11 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
     await db.set_payment(inv["id"], "approved", admin_id)
     ok = await deliver_service(context, await db.get_invoice(inv["id"]))
     extra = "" if ok else "\n⚠️ ارسال لینک‌ها ناموفق بود — از «سرویس‌های من» دوباره بگیر."
+    if skipped:
+        extra += ("\n⚠️ اینباندهای جاافتاده (توی پنل نیستن؛ سرویس فقط روی "
+                  "بقیه اینباندها ساخته شد): "
+                  + "، ".join(map(str, skipped))
+                  + " — از «📡 اینباندها» حذفشون کن یا توی پنل دوباره بسازشون.")
     # referral: first paid purchase → gift for the referrer (silent to the buyer)
     await maybe_grant_referral_gift(context, inv)
     return f"✅ فاکتور #{inv['id']} فعال شد.{extra}"
@@ -312,6 +320,93 @@ async def on_pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 continue
         await q.message.reply_text(f"❌ فاکتور #{inv['id']} رد شد.")
+
+
+# ---------------- manual config attach ----------------
+async def start_manual_config(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              iid: int) -> None:
+    """Step 1 of the manual-config flow: ask the admin for the sub link.
+
+    For a paid order whose panel creation failed (e.g. a deleted
+    inbound), the admin builds the client in the panel by hand and
+    pastes its subscription link here; the bot registers it on the
+    invoice and delivers it to the customer, so renewals later extend
+    the same config instead of the customer waiting on a bugfix.
+    """
+    inv = await db.get_invoice(iid)
+    if not inv:
+        await update.callback_query.answer("یافت نشد.", show_alert=True)
+        return
+    if inv.get("kind") == "topup":
+        await update.callback_query.answer(
+            "شارژ کیف پول کانفیگ ندارد.", show_alert=True)
+        return
+    if inv.get("status") not in ("pending", "active", "expired"):
+        await update.callback_query.answer(
+            "این فاکتور رد شده.", show_alert=True)
+        return
+    await ask_state(
+        update, context, "a_manual_sub",
+        "📎 لینک سابسکریپشن دستی رو بفرست:\n"
+        "همون لینکی که از پنل کپی کردی (مثل "
+        "https://host:2096/base/abcdef0123456789).\n\n"
+        "بعدش ایمیل کلاینت توی پنل رو می‌پرسم تا تمدید هم روی همین "
+        "کانفیگ کار کنه.",
+        iid=iid)
+
+
+async def _activate_manual_config(context: ContextTypes.DEFAULT_TYPE,
+                                  inv: dict, panel: dict, email: str,
+                                  sub_id: str, admin_id: int) -> str:
+    """Register a hand-built panel client on an invoice and deliver it.
+
+    Mirrors the tail of approve_invoice: mark active, store the panel
+    identity, deliver the sub link + QR to the customer. Renewals later
+    extend this same client (they look it up by panel_email).
+    """
+    now = int(time.time())
+    plan = await db.get_plan(inv["plan_id"]) if inv.get("plan_id") else None
+    days = plan["days"] if plan else int(_to_float(await db.get_setting("test_days", "1"), 1))
+    expires_at = now + days * 86400
+    if inv["kind"] == "renew" and inv.get("expires_at"):
+        expires_at = max(inv["expires_at"], now) + days * 86400
+    old_email = inv.get("panel_email") or ""
+    await db.update_invoice(inv["id"], status="active", panel_id=panel["id"],
+                            panel_email=email, sub_id=sub_id,
+                            activated_at=now, expires_at=expires_at, warned_at=0,
+                            volume_warned_at=0)
+    await db.set_payment(inv["id"], "approved", admin_id)
+    ok = await deliver_service(context, await db.get_invoice(inv["id"]))
+    extra = "" if ok else "\n⚠️ ارسال لینک‌ها ناموفق بود — از «سرویس‌های من» دوباره بگیر."
+    if old_email and old_email != email:
+        extra += (f"\nℹ️ کلاینت قبلی ({old_email}) همچنان توی پنله — اگه "
+                  "نمی‌خوایش، از دکمه 🗑 حذفش کن.")
+    await maybe_grant_referral_gift(context, inv)
+    return f"✅ کانفیگ دستی برای فاکتور #{inv['id']} ثبت شد.{extra}"
+
+
+async def start_manual_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            tgid: int) -> None:
+    """Send a hand-built config to any user (mirzabot's add-order-manual).
+
+    The admin picks a plan first (it sets the expiry and the renewal
+    price); then the sub link + panel email are collected exactly like
+    the invoice flow, and the config is registered as the user's
+    subscription so renewals later extend it.
+    """
+    q = update.callback_query
+    plans = await db.list_plans(True)
+    if not plans:
+        await q.answer("پلن فعالی نیست.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(
+        f"📦 {p['name']} — {p['price_toman']:,} تومان",
+        callback_data=f"adm_manual_plan:{tgid}:{p['id']}")] for p in plans]
+    rows.append([InlineKeyboardButton("◀️ برگشت",
+                                      callback_data=f"adm_users_view:{tgid}")])
+    await q.edit_message_text(
+        f"📎 ارسال کانفیگ دستی به کاربر {tgid}\n\nپلن رو انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ---------------- panels ----------------
@@ -373,14 +468,18 @@ async def inbounds_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pi
     if not p:
         await q.answer("یافت نشد.", show_alert=True)
         return
+    ref = (await db.get_setting("ref_client_email", "") or "").strip()
     rows = [[InlineKeyboardButton(f"❌ حذف {ib}",
                                   callback_data=f"adm_inb_del:{pid}:{ib}")]
             for ib in p["inbounds"]]
     rows.append([InlineKeyboardButton("➕ افزودن اینباند",
                                       callback_data=f"adm_inb_add:{pid}")])
+    rows.append([InlineKeyboardButton("🎯 تنظیم مرجع از روی کانفیگ",
+                                      callback_data=f"adm_inb_ref:{pid}")])
     rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_inb_home")])
     await q.edit_message_text(
-        f"📡 اینباندهای «{p['name']}»:\n{', '.join(map(str, p['inbounds'])) or '—'}",
+        f"📡 اینباندهای «{p['name']}»:\n{', '.join(map(str, p['inbounds'])) or '—'}\n"
+        f"🎯 مرجع: {ref or '—'}",
         reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -434,8 +533,8 @@ async def card_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: i
          InlineKeyboardButton("🗑 حذف", callback_data=f"adm_card_del:{cid}")],
         [InlineKeyboardButton("◀️ برگشت", callback_data="adm_card_home")],
     ])
-    await q.edit_message_text(f"💳 `{c['number']}`\n👤 {c['holder']}",
-                              parse_mode="Markdown", reply_markup=kb)
+    await send_md(q.edit_message_text,
+                  f"💳 `{c['number']}`\n👤 {c['holder']}", reply_markup=kb)
 
 
 # ---------------- users ----------------
@@ -460,6 +559,8 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, tgid: 
                            if inv.get("plan_id") else "تست")]]
     rows.append([InlineKeyboardButton("💰 تغییر موجودی",
                                       callback_data=f"adm_users_bal:{tgid}")])
+    rows.append([InlineKeyboardButton("📎 ارسال کانفیگ دستی",
+                                      callback_data=f"adm_users_manualsend:{tgid}")])
     rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_users_home")])
     head = f"👤 {tgid}\n👜 موجودی کیف پول: {T.fmt_price(bal)}"
     if invs:
@@ -485,6 +586,8 @@ async def user_service_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("🗑 حذف از پنل", callback_data=f"adm_users_del:{iid}"),
          InlineKeyboardButton("🔄 تعویض لینک اشتراک",
                               callback_data=f"adm_users_revoke:{iid}")],
+        [InlineKeyboardButton("📎 ثبت کانفیگ دستی",
+                              callback_data=f"adm_users_manual:{iid}")],
         [InlineKeyboardButton("◀️ برگشت",
                               callback_data=f"adm_users_view:{inv['user_id']}")],
     ])
@@ -696,18 +799,254 @@ async def settings_group(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _show(update, title, _with_back(rows))
 
 
+# ---------------- setup guide (first-run wizard) ----------------
+# Entry: "📖 آموزش راه‌اندازی" in the admin bottom menu. The wizard
+# walks a new admin through the first setup step by step — panel URL,
+# API token, sub base, inbounds, bank card — then tests the panel
+# connection. Every step can be skipped; answers are saved as they
+# come in, so leaving mid-way keeps the progress.
+SETUP_ORDER = ["url", "token", "sub", "inb", "card", "holder"]
+
+SETUP_PROMPTS = {
+    "url": ("🔗 قدم ۱ از ۶ — آدرس پنل چیه؟\n"
+            "مثلاً `https://host:port/base`\n"
+            "همون آدرسی که باهاش وارد پنل 3x-ui می‌شی."),
+    "token": ("🔑 قدم ۲ از ۶ — توکن API پنل چیه؟\n"
+              "از پنل: Settings ← API — یه توکن با دسترسی admin بساز و بفرست."),
+    "sub": ("📡 قدم ۳ از ۶ — بیس لینک ساب چیه؟\n"
+            "مثلاً `https://host:2096/hard/`\n"
+            "همون لینکی که توی پنل، بخش Subscription می‌بینی."),
+    "inb": ("🔌 قدم ۴ از ۶ — آیدی اینباندها چیه؟\n"
+            "با کاما جدا کن، مثلاً `1,9,11`.\n"
+            "اگه هنوز اینباند نساختی، این قدم رو رد کن و بعداً از «📡 اینباندها» اضافه کن."),
+    "card": ("💳 قدم ۵ از ۶ — شماره کارتت چیه؟\n"
+             "همون کارتی که مشتری‌ها مبلغ رو بهش واریز می‌کنن."),
+    "holder": "👤 قدم ۶ از ۶ — نام صاحب کارت چیه؟",
+}
+
+
+def _setup_next(step: str) -> str:
+    i = SETUP_ORDER.index(step)
+    return SETUP_ORDER[i + 1] if i + 1 < len(SETUP_ORDER) else "test"
+
+
+async def _setup_advance(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         step: str, carried: dict) -> None:
+    """Go to the next wizard step — or straight to the test when done.
+
+    A card step is skipped when a card already exists (the wizard is
+    for the first setup, not for adding a second card).
+    """
+    nxt = _setup_next(step)
+    if step == "inb" and nxt == "card" and await db.list_cards(False):
+        await _setup_finish(update, context)
+        return
+    if nxt == "test":
+        await _setup_finish(update, context)
+        return
+    await _setup_ask(update, context, nxt, carried)
+
+
+async def _setup_checklist() -> list[str]:
+    p = await db.get_active_panel()
+    cards = await db.list_cards(False)
+    plans = await db.list_plans(False)
+
+    def chk(ok: bool, label: str, cur: str = "") -> str:
+        return f"{'✅' if ok else '⬜'} {label}" + (f" — {cur}" if cur else "")
+
+    return [
+        chk(bool(p and p.get("url")), "آدرس پنل", (p or {}).get("url", "")),
+        chk(bool(p and p.get("token")), "توکن API پنل",
+            config.mask_token(p["token"]) if p and p.get("token") else ""),
+        chk(bool(p and p.get("sub_base")), "بیس لینک ساب",
+            (p or {}).get("sub_base", "")),
+        chk(bool(p and p.get("inbounds")), "اینباندها",
+            ", ".join(map(str, (p or {}).get("inbounds") or []))),
+        chk(bool(cards), "کارت بانکی",
+            f"{len(cards)} کارت" if cards else ""),
+        chk(bool(plans), "پلن‌ها",
+            f"{len(plans)} پلن" if plans else "۴ پلن پیش‌فرض در اولین اجرا ساخته می‌شن"),
+    ]
+
+
+@admin_only
+async def setup_guide_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = await _setup_checklist()
+    text = ("📖 آموزش راه‌اندازی — قدم‌به‌قدم\n\n" + "\n".join(lines) +
+            "\n\nدکمه‌ی شروع رو بزن؛ هر قدم رو می‌تونی رد کنی و هر وقت خواستی "
+            "با ❌ خارج بشی. جواب‌هایی که تا اینجا دادی ذخیره می‌مونن.")
+    kb = _with_back([[InlineKeyboardButton("▶️ شروع راه‌اندازی",
+                                           callback_data="adm_setup_start")]])
+    await _show(update, text, kb)
+
+
+async def _setup_ask(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     step: str, carried: dict) -> None:
+    """Ask one wizard step; `carried` values travel in the state dict."""
+    p = await db.get_active_panel()
+    cur = ""
+    if step == "url" and p and p.get("url"):
+        cur = f"\nفعلی: {p['url']}"
+    elif step == "token" and p and p.get("token"):
+        cur = f"\nفعلی: {config.mask_token(p['token'])}"
+    elif step == "sub" and p and p.get("sub_base"):
+        cur = f"\nفعلی: {p['sub_base']}"
+    elif step == "inb" and p and p.get("inbounds"):
+        cur = "\nفعلی: " + ", ".join(map(str, p["inbounds"]))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ رد کردن",
+                              callback_data=f"adm_setup_skip:{step}"),
+         InlineKeyboardButton("❌ خروج", callback_data="adm_setup_exit")],
+    ])
+    await ask_state(update, context, f"a_setup_{step}",
+                    SETUP_PROMPTS[step] + cur, extra_kb=kb, **carried)
+
+
+async def _setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Begin at the first incomplete step (or the first step, to redo)."""
+    p = await db.get_active_panel()
+    cards = await db.list_cards(False)
+    done = {
+        "url": bool(p and p.get("url")),
+        "token": bool(p and p.get("token")),
+        "sub": bool(p and p.get("sub_base")),
+        "inb": bool(p and p.get("inbounds")),
+        "card": bool(cards),
+        "holder": bool(cards),
+    }
+    step = next((s for s in SETUP_ORDER if not done[s]), "url")
+    await _setup_ask(update, context, step, {})
+
+
+async def _setup_save_panel(st: dict, inb: list[int]) -> None:
+    """Persist the wizard's panel answers (create or update the active panel)."""
+    p = await db.get_active_panel()
+    fields = {"inbounds_json": json.dumps(sorted(set(inb)))}
+    if st.get("url"):
+        fields["url"] = st["url"]
+    if st.get("token"):
+        fields["token"] = st["token"]
+    if st.get("sub"):
+        fields["sub_base"] = st["sub"]
+    if p:
+        await db.update_panel(p["id"], **fields)
+    else:
+        await db.add_panel("پنل اصلی", st.get("url", ""), st.get("token", ""),
+                           st.get("sub", ""), sorted(set(inb)))
+
+
+async def _setup_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Last step: test the panel connection and show the summary."""
+    context.user_data.pop("st", None)
+    p = await db.get_active_panel()
+    if not p or not p.get("url"):
+        await _show(update,
+                    "⚠️ هنوز پنلی ثبت نشده — از «🖥 مدیریت پنل» یا همین آموزش، "
+                    "اول آدرس پنل رو کامل کن.",
+                    _with_back([]))
+        return
+    pc = panel_client_for(p)
+    res = await pc.test_connection()
+    cards = await db.list_cards(False)
+    plans = await db.list_plans(False)
+    text = ("🎉 راه‌اندازی کامل شد!\n\n"
+            f"🖥 پنل: {p['url']}\n"
+            f"📡 اینباندها: {', '.join(map(str, p['inbounds'])) or '—'}\n"
+            f"💳 کارت: {len(cards)} عدد\n"
+            f"📦 پلن: {len(plans)} عدد (قیمت‌ها رو از «📦 پلن‌ها» عوض کن)\n\n"
+            f"🔌 تست اتصال: {res['fa']}\n\n"
+            "یه خرید آزمایشی با یه اکانت تلگرام دیگه بگیر تا مطمئن بشی "
+            "لینک ساب تحویل داده می‌شه.")
+    await _show(update, text, _with_back([]))
+
+
+async def _setup_answer(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        st: dict, step: str, txt: str) -> None:
+    """One wizard answer: validate, save, advance. `st` is user_data['st']."""
+    msg = update.message
+    carried = {k: v for k, v in st.items() if k != "k"}
+    if step == "url":
+        if not txt or not txt.startswith(("http://", "https://")):
+            await msg.reply_text(
+                "❌ آدرس معتبر نیست — باید با http:// یا https:// شروع بشه. "
+                "دوباره بفرست:")
+            return
+        carried["url"] = txt.rstrip("/")
+    elif step == "token":
+        if not txt:
+            await msg.reply_text("❌ توکن خالیه — توکن API پنل رو بفرست:")
+            return
+        carried["token"] = txt
+    elif step == "sub":
+        if not txt:
+            await msg.reply_text("❌ بیس ساب خالیه — لینک ساب رو بفرست:")
+            return
+        carried["sub"] = txt.rstrip("/")
+    elif step == "inb":
+        inb = [int(x) for x in txt.split(",") if x.strip().isdigit()]
+        if not inb:
+            await msg.reply_text("❌ آیدی معتبر نیست — مثلاً `1,9,11` بفرست:")
+            return
+        await _setup_save_panel(carried, inb)
+    elif step == "card":
+        if not txt.replace(" ", "").isdigit():
+            await msg.reply_text("شماره کارت فقط عدد باشه:")
+            return
+        carried["number"] = txt.replace(" ", "")
+    elif step == "holder":
+        await db.add_card(carried.get("number", ""), txt)
+        await _setup_finish(update, context)
+        return
+    await _setup_advance(update, context, step, carried)
+
+
+async def _setup_skip(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      step: str) -> None:
+    """Skip one wizard step (from the ⏭ button on the prompt message)."""
+    st = context.user_data.get("st") or {}
+    if st.get("k") != f"a_setup_{step}":
+        await setup_guide_home(update, context)
+        return
+    carried = {k: v for k, v in st.items() if k != "k"}
+    if step == "inb":
+        p = await db.get_active_panel()
+        if p or carried.get("url") or carried.get("token") or carried.get("sub"):
+            await _setup_save_panel(carried, list(p["inbounds"]) if p else [])
+    elif step == "card":
+        # no card at all — go straight to the test
+        await _setup_finish(update, context)
+        return
+    elif step == "holder":
+        if carried.get("number"):
+            await db.add_card(carried["number"], "—")
+        await _setup_finish(update, context)
+        return
+    await _setup_advance(update, context, step, carried)
+
+
 # ---------------- state machine (admin text/media input) ----------------
 async def ask_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     kind: str, prompt: str, extra_kb=None, **extra) -> None:
-    context.user_data["st"] = {"k": kind, **extra}
+    """Ask the admin for the next input and remember what it is for.
+
+    The prompt is sent as Markdown, with a plain-text retry: a literal
+    underscore in an example (shahin_1234) breaks Markdown parsing and
+    used to fail the whole tap silently (the error alert could not be
+    shown either, because the query was already answered). The state is
+    only stored after the prompt was actually delivered, so a failed
+    prompt never leaves the bot waiting for input the admin never saw.
+    """
     q = update.callback_query
+    msg = q.message if q else update.message
     if q:
         await q.answer()
-        await q.message.reply_text(prompt, reply_markup=extra_kb,
-                                   parse_mode="Markdown")
-    else:
-        await update.message.reply_text(prompt, reply_markup=extra_kb,
-                                        parse_mode="Markdown")
+    try:
+        await msg.reply_text(prompt, reply_markup=extra_kb,
+                             parse_mode="Markdown")
+    except Exception:
+        await msg.reply_text(prompt, reply_markup=extra_kb)
+    context.user_data["st"] = {"k": kind, **extra}
 
 
 def _num(txt: str) -> int | None:
@@ -807,6 +1146,42 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                   inbounds_json=json.dumps(sorted(set(inb))))
             context.user_data.pop("st", None)
             await msg.reply_text("✅ اینباند اضافه شد.")
+        elif k == "a_inbref":
+            email = txt.strip()
+            if not email or any(ch.isspace() for ch in email) \
+                    or "/" in email or ":" in email:
+                await msg.reply_text(
+                    "❌ ایمیل معتبر نیست — فقط خود ایمیل رو بفرست:")
+                return True
+            p = await db.get_panel(st["pid"])
+            if not p:
+                context.user_data.pop("st", None)
+                await msg.reply_text("⚠️ پنل پیدا نشد.")
+                return True
+            pc = panel_client_for(p)
+            try:
+                ids = await pc.client_inbounds(email)
+            except PanelError as e:
+                if e.is_not_found:
+                    await msg.reply_text(
+                        "❌ این ایمیل توی پنل پیدا نشد — ایمیل رو چک کن و "
+                        "دوباره بفرست:")
+                    return True
+                await msg.reply_text(f"⚠️ خطای پنل: {e} — دوباره تلاش کن:")
+                return True
+            if not ids:
+                await msg.reply_text(
+                    "⚠️ این کانفیگ اینباندی نداره — یه کانفیگ دیگه بفرست:")
+                return True
+            await db.set_setting("ref_client_email", email)
+            await db.update_panel(p["id"],
+                                  inbounds_json=json.dumps(sorted(ids)))
+            context.user_data.pop("st", None)
+            await msg.reply_text(
+                f"✅ مرجع ثبت شد: {email}\n"
+                f"📡 اینباندها از روی این کانفیگ: "
+                f"{', '.join(map(str, sorted(ids)))}\n"
+                "از این به بعد سرویس‌های جدید با همین اینباندها ساخته می‌شن.")
         elif k == "a_planadd_name":
             context.user_data["st"] = {"k": "a_planadd_days", "name": txt}
             await msg.reply_text("⏱ مدت (روز)؟")
@@ -942,6 +1317,78 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except Exception as e:
                 await msg.reply_text(f"⚠️ ارسال نشد: {e}")
             context.user_data.pop("st", None)
+        elif k == "a_manual_sub":
+            sub_id = extract_sub_id(txt)
+            if not sub_id:
+                await msg.reply_text(
+                    "❌ لینک ساب معتبر نیست.\n"
+                    "لینک سابسکریپشن رو کامل بفرست — مثل:\n"
+                    "https://host:2096/base/abcdef0123456789")
+                return True
+            context.user_data["st"] = {"k": "a_manual_email",
+                                       "iid": st.get("iid"),
+                                       "tgid": st.get("tgid"),
+                                       "plan_id": st.get("plan_id"),
+                                       "sub_id": sub_id}
+            await msg.reply_text(
+                "🔌 ایمیل کلاینت توی پنل چیه؟\n"
+                "همون ایمیلی که موقع ساخت دستی توی 3x-ui وارد کردی "
+                "(مثلاً `name_1234`).")
+        elif k == "a_manual_email":
+            email = txt.strip()
+            if not email or any(ch.isspace() for ch in email) \
+                    or "/" in email or ":" in email:
+                await msg.reply_text(
+                    "❌ ایمیل معتبر نیست — فقط خود ایمیل رو بفرست:")
+                return True
+            if st.get("iid"):
+                inv = await db.get_invoice(st["iid"])
+                if not inv:
+                    context.user_data.pop("st", None)
+                    await msg.reply_text("⚠️ فاکتور پیدا نشد.")
+                    return True
+            else:
+                # per-user send: no invoice yet — created after the
+                # email checks out, so an abandoned flow leaves nothing
+                inv = None
+            panel = await db.get_panel(inv["panel_id"]) if inv and inv.get("panel_id") \
+                else await db.get_active_panel()
+            if not panel:
+                context.user_data.pop("st", None)
+                await msg.reply_text("⚠️ پنل فعالی ثبت نشده.")
+                return True
+            pc = panel_client_for(panel)
+            unverified = False
+            try:
+                client = await pc.get_client(email)
+                if not client:
+                    raise PanelError("not found", code="notfound")
+            except PanelError as e:
+                if e.is_not_found:
+                    await msg.reply_text(
+                        "❌ این ایمیل توی پنل پیدا نشد — ایمیل رو چک کن و "
+                        "دوباره بفرست:")
+                    return True
+                unverified = True
+                log.warning("manual config: panel verify failed (%s); "
+                            "proceeding unverified", e)
+            if inv is None:
+                plan = await db.get_plan(st["plan_id"])
+                if not plan:
+                    context.user_data.pop("st", None)
+                    await msg.reply_text("⚠️ پلن پیدا نشد.")
+                    return True
+                iid = await db.create_invoice(st["tgid"], "purchase",
+                                              plan["id"], plan["price_toman"])
+                inv = await db.get_invoice(iid)
+            res = await _activate_manual_config(context, inv, panel, email,
+                                                st["sub_id"],
+                                                update.effective_user.id)
+            context.user_data.pop("st", None)
+            if unverified:
+                res += ("\n⚠️ پنل موقع ثبت در دسترس نبود و ایمیل تأیید نشد — "
+                        "اگه تمدید به مشکل خورد، ایمیل رو چک کن.")
+            await msg.reply_text(res)
         elif k == "a_bal":
             n = _snum(txt)
             if n is None or n == 0:
@@ -958,6 +1405,8 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 pass
             await msg.reply_text(
                 f"✅ موجودی کاربر {st['tgid']} به {T.fmt_price(new_bal)} رسید.")
+        elif k.startswith("a_setup_"):
+            await _setup_answer(update, context, st, k[len("a_setup_"):], txt)
         else:
             return False
     except Exception as e:
@@ -987,6 +1436,8 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await pending_payments(update, context)
         elif data.startswith("adm_pay_ok:") or data.startswith("adm_pay_no:"):
             await on_pay_decision(update, context)
+        elif data.startswith("adm_pay_manual:"):
+            await start_manual_config(update, context, int(parts[1]))
         # panels
         elif data == "adm_panel_home":
             await panels_menu(update, context)
@@ -1023,6 +1474,13 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             inb = [x for x in p["inbounds"] if x != ib]
             await db.update_panel(pid, inbounds_json=json.dumps(inb))
             await inbounds_detail(update, context, pid)
+        elif data.startswith("adm_inb_ref:"):
+            await ask_state(update, context, "a_inbref",
+                            "🎯 ایمیل کانفیگ مرجع توی پنل چیه؟\n"
+                            "مثلاً همون کانفیگ خودت (`shahin_1234`).\n"
+                            "از این به بعد هر سرویس جدید با همون اینباندهایی "
+                            "ساخته می‌شه که این کانفیگ استفاده می‌کنه.",
+                            pid=int(parts[1]))
         # plans
         elif data == "adm_plan_home":
             await plans_menu(update, context)
@@ -1069,6 +1527,22 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             f"موجودی فعلی: {T.fmt_price(bal)}\n\n"
                             "عدد مثبت برای افزایش، منفی برای کاهش (تومان):",
                             tgid=tgid)
+        elif data.startswith("adm_users_manual:"):
+            await start_manual_config(update, context, int(parts[1]))
+        elif data.startswith("adm_users_manualsend:"):
+            await start_manual_send(update, context, int(parts[1]))
+        elif data.startswith("adm_manual_plan:"):
+            tgid, plan_id = int(parts[1]), int(parts[2])
+            plan = await db.get_plan(plan_id)
+            if not plan:
+                await q.answer("پلن پیدا نشد.", show_alert=True)
+            else:
+                await ask_state(
+                    update, context, "a_manual_sub",
+                    f"📦 پلن «{plan['name']}» انتخاب شد.\n\n"
+                    "📎 لینک سابسکریپشن دستی رو بفرست:\n"
+                    "همون لینکی که از پنل کپی کردی.",
+                    tgid=tgid, plan_id=plan_id)
         elif data.startswith("adm_users_dis:") or \
                 data.startswith("adm_users_en:") or \
                 data.startswith("adm_users_del:") or \
@@ -1137,6 +1611,15 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await ask_state(update, context, "a_setkey",
                             f"{SETTING_LABELS.get(key, key)}؟\nفعلی: {shown or '—'}",
                             key=key)
+        # setup guide
+        elif data == "adm_setup_start":
+            await _setup_start(update, context)
+        elif data.startswith("adm_setup_skip:"):
+            await _setup_skip(update, context, parts[1])
+        elif data == "adm_setup_exit":
+            context.user_data.pop("st", None)
+            await q.answer("خارج شدی — چیزی که تا اینجا ذخیره شده سر جاشه.")
+            await setup_guide_home(update, context)
         # support reply
         elif data.startswith("adm_reply:"):
             await ask_state(update, context, "admin_reply", T.SUPPORT_REPLY_ASK,

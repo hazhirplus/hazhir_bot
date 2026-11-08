@@ -23,6 +23,7 @@ def admin_sections() -> ReplyKeyboardMarkup:
          ["📦 پلن‌ها", "💳 کارت‌ها"],
          ["👥 کاربران", "📚 آموزش‌ها"],
          ["📢 پیام همگانی", "⚙️ تنظیمات"],
+         ["📖 آموزش راه‌اندازی"],
          ["🔙 منوی اصلی"]],
         resize_keyboard=True,
     )
@@ -99,11 +100,20 @@ def crypto_pay_kb(invoice_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def pay_decision_kb(invoice_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
+def pay_decision_kb(invoice_id: int, manual: bool = True) -> InlineKeyboardMarkup:
+    """Approve / reject, plus manual-config attach for panel invoices.
+
+    `manual` is False for top-ups (no panel client), where attaching a
+    config makes no sense.
+    """
+    rows = [[
         InlineKeyboardButton("✅ تأیید", callback_data=f"adm_pay_ok:{invoice_id}"),
         InlineKeyboardButton("❌ رد", callback_data=f"adm_pay_no:{invoice_id}"),
-    ]])
+    ]]
+    if manual:
+        rows.append([InlineKeyboardButton(
+            "📎 ثبت کانفیگ دستی", callback_data=f"adm_pay_manual:{invoice_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def service_kb(invoice_id: int) -> InlineKeyboardMarkup:

@@ -133,7 +133,11 @@ def test_admin_callback_namespace_tidy():
     for cb in _all_callbacks(kb):
         assert cb.startswith("adm_"), cb
     assert _all_callbacks(K.back_admin_kb()) == ["adm_home"]
-    assert _all_callbacks(K.pay_decision_kb(7)) == ["adm_pay_ok:7", "adm_pay_no:7"]
+    assert _all_callbacks(K.pay_decision_kb(7)) == [
+        "adm_pay_ok:7", "adm_pay_no:7", "adm_pay_manual:7"]
+    # top-ups have no panel client: no manual-config button
+    assert _all_callbacks(K.pay_decision_kb(7, manual=False)) == [
+        "adm_pay_ok:7", "adm_pay_no:7"]
     assert _all_callbacks(K.renew_one_kb(9)) == ["u:renewone:9"]
     assert _all_callbacks(K.quick_guide_kb()) == ["u:tuts"]
     assert _all_callbacks(K.tut_back_kb()) == ["u:tuts"]
@@ -534,7 +538,8 @@ def test_admin_sections_tidy():
     assert all(len(r) <= 2 for r in rows)
     assert rows[-1] == ["🔙 منوی اصلی"]
     flat = [b for r in rows for b in r]
-    assert len(flat) == 11  # 10 sections + back
+    assert len(flat) == 12  # 11 sections + back
+    assert "📖 آموزش راه‌اندازی" in flat
 
 
 def test_admin_menu_text_routing(dbpath, monkeypatch):

@@ -52,6 +52,31 @@ def gen_subid() -> str:
     return secrets.token_hex(8)
 
 
+def extract_sub_id(text: str) -> str | None:
+    """Pull the subscription id out of a sub URL the admin pastes.
+
+    Accepts a full subscription URL (https://host:2096/base/<subid>),
+    the same URL with a trailing slash, or a bare id. The id is any
+    8-64 char [A-Za-z0-9_-] token, kept exactly as pasted (the panel
+    treats it case-sensitively). The bot generates 16-hex ids, but a
+    client built by hand in 3x-ui gets a panel-generated id that can
+    contain letters beyond a-f (e.g. ...g7Qz...), so a hex-only check
+    wrongly rejects real links. Anything else (a vless:// config link,
+    subscription content, garbage) returns None so the caller can ask
+    again.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if "://" in t:
+        # URL: last non-empty path segment (query/fragment stripped)
+        t = t.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        t = t.rsplit("/", 1)[-1].strip()
+    if re.fullmatch(r"[0-9A-Za-z_-]{8,64}", t):
+        return t
+    return None
+
+
 def gen_email(username: str | None, tg_id: int) -> str:
     """Service username = telegram username + random 4 digits (fallback: id<tgid>)."""
     base = re.sub(r"[^A-Za-z0-9_]", "", (username or ""))[:20] or f"id{tg_id}"
@@ -192,6 +217,21 @@ class PanelClient:
         if isinstance(obj, dict) and "client" in obj and isinstance(obj["client"], dict):
             return obj["client"]
         return obj if isinstance(obj, dict) and obj.get("email") else None
+
+    async def client_inbounds(self, email: str) -> list[int] | None:
+        """Inbound ids the named client is attached to (None if unknown).
+
+        3x-ui's /clients/get/{email} returns obj {client, inboundIds};
+        mirzabot's panel setup reads exactly this to learn the panel's
+        inbounds from a reference client. Raises PanelError when the
+        client does not exist or the panel is unreachable.
+        """
+        data = await self._call("GET", f"/clients/get/{email}")
+        obj = data.get("obj") or {}
+        ids = obj.get("inboundIds") if isinstance(obj, dict) else None
+        if not isinstance(ids, list):
+            return None
+        return [int(x) for x in ids if str(x).isdigit()]
 
     async def traffic(self, email: str) -> dict:
         data = await self._call("GET", f"/clients/traffic/{email}")

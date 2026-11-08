@@ -286,6 +286,7 @@ def _mk_crypto_invoice(p, **kw):
 @pytest.mark.asyncio
 async def test_crypto_lifecycle_activate(monkeypatch, tmp_path):
     import helpers
+    import handlers_admin
     p = str(tmp_path / "life.db")
     await db.init_db(p)
     await db.seed_from_env(p)
@@ -296,7 +297,12 @@ async def test_crypto_lifecycle_activate(monkeypatch, tmp_path):
     pid = await db.add_plan("p", 30, 10, 90000, p)
     await db.upsert_user(777001, "buyer", p)
     fake = _FakePanel()
+    # Patch both namespaces: handlers_admin binds panel_client_for at
+    # import time, so patching helpers alone only works if this module
+    # happens to be imported after the patch (fragile import order).
     monkeypatch.setattr(helpers, "panel_client_for", lambda panel: fake)
+    monkeypatch.setattr(handlers_admin, "panel_client_for",
+                        lambda panel: fake)
 
     iid = await _acrypto_invoice(p, plan_id=pid)
     inv = await db.get_invoice(iid, p)
@@ -331,6 +337,7 @@ async def test_crypto_expiry_job(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_crypto_job_activates(monkeypatch, tmp_path):
     import helpers
+    import handlers_admin
     import jobs
     p = str(tmp_path / "job.db")
     await db.init_db(p)
@@ -342,7 +349,11 @@ async def test_crypto_job_activates(monkeypatch, tmp_path):
     pid = await db.add_plan("p", 30, 10, 90000, p)
     await db.upsert_user(777003, "jobbuyer", p)
     fake = _FakePanel()
+    # See test_crypto_lifecycle_activate: patch both namespaces so the
+    # test does not depend on handlers_admin import order.
     monkeypatch.setattr(helpers, "panel_client_for", lambda panel: fake)
+    monkeypatch.setattr(handlers_admin, "panel_client_for",
+                        lambda panel: fake)
 
     async def fake_find(inv):
         return "0xjobtx"

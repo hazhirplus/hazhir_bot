@@ -13,7 +13,7 @@ import text as T
 import keyboards as K
 import chainwatch
 from helpers import (notify_admins, deliver_service, panel_client_for,
-                     create_panel_client, activate_crypto_invoice)
+                     create_panel_client, activate_crypto_invoice, send_md)
 from panel import PanelError, gb_to_bytes, days_to_ms, derive_status, bytes_to_gb
 
 log = logging.getLogger("hozhir")
@@ -133,13 +133,15 @@ async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not plan or not card_block:
         await q.edit_message_text(T.NO_CARD if not card_block else T.NO_PLANS)
         return
-    context.user_data["st"] = {"k": "receipt", "plan_id": pid, "kind": "purchase"}
     guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
     head = f"{guide}\n\n" if guide else ""
-    await q.edit_message_text(
+    # State only after the screen was delivered: if the edit fails the
+    # user is not left waiting for a receipt they never saw the card for.
+    await send_md(
+        q.edit_message_text,
         f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
-        f"💰 مبلغ: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}",
-        parse_mode="Markdown")
+        f"💰 مبلغ: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}")
+    context.user_data["st"] = {"k": "receipt", "plan_id": pid, "kind": "purchase"}
 
 
 async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
@@ -148,6 +150,14 @@ async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
     if not card_block:
         await q.edit_message_text(T.NO_CARD)
         return
+    guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
+    head = f"{guide}\n\n" if guide else ""
+    # State only after the screen was delivered: if the edit fails the
+    # user is not left waiting for a receipt they never saw the card for.
+    await send_md(
+        q.edit_message_text,
+        f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
+        f"💰 مبلغ تمدید: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}")
     context.user_data["st"] = {
         "k": "receipt", "plan_id": plan["id"], "kind": "renew",
         "panel_id": inv.get("panel_id"),
@@ -155,12 +165,6 @@ async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
         "sub_id": inv.get("sub_id", ""),
         "base_expires": inv.get("expires_at", 0),
     }
-    guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
-    head = f"{guide}\n\n" if guide else ""
-    await q.edit_message_text(
-        f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
-        f"💰 مبلغ تمدید: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}",
-        parse_mode="Markdown")
 
 
 async def renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -248,9 +252,16 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         sub_id=target.get("sub_id", ""),
         expires_at=target.get("expires_at", 0))
     context.user_data.pop("st", None)
-    res = await approve_invoice(context, await db.get_invoice(iid), None)
+    try:
+        res = await approve_invoice(context, await db.get_invoice(iid), None)
+    except Exception as e:
+        log.warning("wallet renew approval failed: %s", e)
+        res = f"⚠️ خطا: {e}"
     inv = await db.get_invoice(iid)
-    if inv["status"] == "expired":  # panel provisioning failed → refund
+    # approve_invoice leaves a failed invoice "pending" (it never sets
+    # "expired") — refund whenever the service did not become active,
+    # or the wallet keeps money for a service that was never created.
+    if inv["status"] != "active":
         await db.add_balance(uid, plan["price_toman"])
         await q.edit_message_text(f"⚠️ {res}\nمبلغ به کیف پولت برگشت.")
         return
@@ -279,9 +290,16 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     iid = await db.create_invoice(user_id=uid, kind="purchase",
                                   plan_id=plan["id"],
                                   price_toman=plan["price_toman"])
-    res = await approve_invoice(context, await db.get_invoice(iid), None)
+    try:
+        res = await approve_invoice(context, await db.get_invoice(iid), None)
+    except Exception as e:
+        log.warning("wallet buy approval failed: %s", e)
+        res = f"⚠️ خطا: {e}"
     inv = await db.get_invoice(iid)
-    if inv["status"] == "expired":  # panel provisioning failed → refund
+    # approve_invoice leaves a failed invoice "pending" (it never sets
+    # "expired") — refund whenever the service did not become active,
+    # or the wallet keeps money for a service that was never created.
+    if inv["status"] != "active":
         await db.add_balance(uid, plan["price_toman"])
         await q.edit_message_text(f"⚠️ {res}\nمبلغ به کیف پولت برگشت.")
         return
@@ -384,8 +402,8 @@ async def _show_crypto_pay(q, inv: dict, plan: dict,
     ]
     if low_value_warn:
         lines.append(T.CRYPTO_WARN_FEE)
-    await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
-                              reply_markup=K.crypto_pay_kb(inv["id"]))
+    await send_md(q.edit_message_text, "\n".join(lines),
+                  reply_markup=K.crypto_pay_kb(inv["id"]))
 
 
 async def crypto_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -611,7 +629,7 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, st
                                    kind=T.KIND_FA.get(st["kind"], st["kind"]),
                                    price=T.fmt_price(price),
                                    receipt=receipt_note) + dup_warn,
-        reply_markup=K.pay_decision_kb(iid))
+        reply_markup=K.pay_decision_kb(iid, manual=(st["kind"] != "topup")))
     if file_id and not file_id.startswith("text:"):
         for aid in config.ADMIN_IDS:
             try:
@@ -674,11 +692,11 @@ async def send_service_card(target, context, inv: dict, edit: bool = False) -> N
     kb = K.service_kb(inv["id"])
     if edit and hasattr(target, "edit_text"):
         try:
-            await target.edit_text(txt, parse_mode="Markdown", reply_markup=kb)
+            await send_md(target.edit_text, txt, reply_markup=kb)
             return
         except Exception:
             pass
-    await target.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+    await send_md(target.reply_text, txt, reply_markup=kb)
 
 
 async def service_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -745,7 +763,9 @@ async def grant_test_account(context: ContextTypes.DEFAULT_TYPE,
     pc = panel_client_for(panel)
     now = int(time.time())
     try:
-        email, sub_id = await create_panel_client(pc, panel, inv, days, gb, now)
+        email, sub_id, skipped = await create_panel_client(pc, panel, inv, days, gb, now)
+        if skipped:
+            log.warning("test account skipped inbounds %s", skipped)
     except PanelError as e:
         log.warning("test account panel error: %s", e)
         await db.update_invoice(iid, status="expired")
@@ -852,11 +872,14 @@ async def _handle_state(update: Update, context: ContextTypes.DEFAULT_TYPE, st: 
             context.user_data.pop("st", None)
             await update.message.reply_text(T.NO_CARD)
             return
+        # State only after the card screen was delivered: if the reply
+        # fails the user stays in wallet_amount and can send it again,
+        # instead of being stuck waiting for a receipt they never saw.
+        await send_md(
+            update.message.reply_text,
+            f"{card_block}\n\n💰 مبلغ شارژ: {T.fmt_price(n)}\n\n{T.RECEIPT_ASK}")
         context.user_data["st"] = {"k": "receipt", "kind": "topup",
                                    "plan_id": None, "amount": n}
-        await update.message.reply_text(
-            f"{card_block}\n\n💰 مبلغ شارژ: {T.fmt_price(n)}\n\n{T.RECEIPT_ASK}",
-            parse_mode="Markdown")
     else:
         # admin states are handled in handlers_admin
         from handlers_admin import handle_admin_state
