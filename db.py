@@ -751,6 +751,26 @@ async def add_balance(tg_id: int, delta: int, path: str | None = None) -> int:
         return int((await cur.fetchone())[0] or 0)
 
 
+async def debit_balance(tg_id: int, amount: int, path: str | None = None) -> bool:
+    """Atomically debit `amount` if the balance covers it. True on success.
+
+    Single conditional UPDATE: the funds check and the debit happen in one
+    statement, so two concurrent debits cannot both pass — the second sees
+    the reduced balance and affects 0 rows. Returns False (no change) when
+    funds are short or the user has no row yet. Fixes the wallet double-spend
+    (vibe-check check 32, 2026-11-10).
+    """
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        cur = await con.execute(
+            "UPDATE users SET balance_toman = balance_toman - ? "
+            "WHERE tg_id = ? AND balance_toman >= ?",
+            (int(amount), tg_id, int(amount)),
+        )
+        await con.commit()
+        return cur.rowcount == 1
+
+
 # ---------------- referrals ----------------
 async def attribute_referral(referred_id: int, referrer_id: int,
                              path: str | None = None) -> bool:

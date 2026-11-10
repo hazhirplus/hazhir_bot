@@ -238,12 +238,12 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.edit_message_text(T.NO_PLANS)
         return
     uid = q.from_user.id
-    bal = await db.get_balance(uid)
-    if bal < plan["price_toman"]:
+    # Atomic conditional debit: the funds check and the debit are one SQL
+    # statement, so two rapid taps cannot both pass (vibe-check 32).
+    if not await db.debit_balance(uid, plan["price_toman"]):
         await q.answer("موجودی کیف پول کافی نیست.", show_alert=True)
         return
     from handlers_admin import approve_invoice
-    await db.add_balance(uid, -plan["price_toman"])
     iid = await db.create_invoice(
         user_id=uid, kind="renew", plan_id=plan["id"],
         price_toman=plan["price_toman"],
@@ -277,16 +277,16 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await q.edit_message_text(T.NO_PLANS)
         return
     uid = q.from_user.id
-    bal = await db.get_balance(uid)
-    if bal < plan["price_toman"]:
-        await q.answer("موجودی کیف پول کافی نیست.", show_alert=True)
-        return
     panel = await db.get_active_panel()
     if not panel:
         await q.edit_message_text(T.NO_PANEL)
         return
+    # Atomic conditional debit (see renew_pay_wallet): check + debit in one
+    # statement so a double-tap cannot spend the same balance twice.
+    if not await db.debit_balance(uid, plan["price_toman"]):
+        await q.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+        return
     from handlers_admin import approve_invoice
-    await db.add_balance(uid, -plan["price_toman"])
     iid = await db.create_invoice(user_id=uid, kind="purchase",
                                   plan_id=plan["id"],
                                   price_toman=plan["price_toman"])
