@@ -16,6 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import config
+import backup
 import db
 import text as T
 import keyboards as K
@@ -741,6 +742,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------- settings ----------------
 @admin_only
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    auto_on = await backup.auto_backup_on()
     kb = _with_back([
         [InlineKeyboardButton("💬 متن‌ها", callback_data="adm_set_texts"),
          InlineKeyboardButton("🎁 اکانت تست", callback_data="adm_set_test")],
@@ -749,6 +751,9 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [InlineKeyboardButton("📥 لینک دانلود برنامه‌ها", callback_data="adm_set_dl"),
          InlineKeyboardButton("👥 رفرال", callback_data="adm_set_ref")],
         [InlineKeyboardButton("💎 ارز دیجیتال", callback_data="adm_set_crypto")],
+        [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="adm_set_backup"),
+         InlineKeyboardButton(f"💾 بکاپ خودکار: {'✅ روشن' if auto_on else '⚪️ خاموش'}",
+                              callback_data="adm_set_autobackup")],
     ])
     await _show(update, "⚙️ تنظیمات:", kb)
 
@@ -1598,6 +1603,18 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await settings_group(update, context, "ref")
         elif data.startswith("adm_set_crypto"):
             await settings_group(update, context, "crypto")
+        elif data == "adm_set_backup":
+            await q.answer("⏳ در حال ساخت بکاپ…")
+            sent = await backup.send_backup_to_admins(context.bot)
+            if sent:
+                await _show(update, T.BACKUP_MANUAL_OK, K.back_admin_kb())
+            else:
+                await _show(update, T.BACKUP_MANUAL_FAIL, K.back_admin_kb())
+        elif data == "adm_set_autobackup":
+            cur = await backup.auto_backup_on()
+            await db.set_setting(backup.AUTO_BACKUP_KEY,
+                                 "0" if cur else "1")
+            await settings_menu(update, context)
         elif data.startswith("adm_set_toggle:"):
             key = parts[1]
             group = parts[2] if len(parts) > 2 else "test"

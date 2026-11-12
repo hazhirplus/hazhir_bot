@@ -11,6 +11,7 @@ import config
 import db
 import text as T
 import keyboards as K
+from backup import nightly_backup_job
 from helpers import notify_admins, panel_client_for, volume_pct_used
 from panel import PanelError
 
@@ -175,3 +176,8 @@ def schedule_jobs(job_queue) -> None:
     job_queue.run_daily(daily_report,
                         time=datetime.time(9, 0, tzinfo=TEHRAN),
                         name="daily_report")
+    # بکاپ شبانه دیتابیس (درخواست کاربر ۲۰۲۶-۱۱-۱۲): هر شب ساعت ۰۰:۰۰ تهران
+    # فایل بکاپ برای ادمین‌ها فرستاده می‌شود (بازیابی بعد از مرگ/تعویض سرور).
+    job_queue.run_daily(nightly_backup_job,
+                        time=datetime.time(0, 0, tzinfo=TEHRAN),
+                        name="nightly_backup")

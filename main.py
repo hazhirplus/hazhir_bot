@@ -53,6 +53,14 @@ async def post_init(app) -> None:
             log.info("seeded %d pending crypto amounts", sn)
     except Exception as e:
         log.warning("crypto amount seeding failed: %s", e)
+    # بکاپ شبانه: اگر شبی از دست رفته باشد (یا اولین اجراست)، در استارت
+    # جبرانی بفرست — نشانه‌اش رسیدن فایل بکاپ به ادمین بعد از استارت است.
+    try:
+        import backup
+        if await backup.maybe_send_catchup_backup(app.bot):
+            log.info("catch-up nightly backup sent at startup")
+    except Exception as e:
+        log.warning("catch-up backup failed: %s", e)
     log.info("DB ready; admins=%d", len(config.ADMIN_IDS))
 
 
