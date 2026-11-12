@@ -12,6 +12,8 @@ import db
 import text as T
 import keyboards as K
 import chainwatch
+from channel_lock import (enforce_channel_lock, missing_lock_channels,
+                          show_channel_lock)
 from helpers import (notify_admins, deliver_service, panel_client_for,
                      create_panel_client, activate_crypto_invoice, send_md)
 from panel import PanelError, gb_to_bytes, days_to_ms, derive_status, bytes_to_gb
@@ -34,6 +36,8 @@ async def _crypto_available() -> bool:
 # ---------------- /start & main menu ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
+    if await enforce_channel_lock(update.message, context, u.id):
+        return
     existing = await db.get_user(u.id)
     await db.upsert_user(u.id, u.username)
     # referral attribution: first-ever /start with ref_<tgid>
@@ -60,6 +64,8 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route main-menu buttons and state-driven text input."""
     msg = update.message
     if not msg or not msg.text:
+        return
+    if await enforce_channel_lock(msg, context, msg.from_user.id):
         return
     st = context.user_data.get("st")
     if st:
@@ -89,17 +95,90 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------- buy flow ----------------
-async def show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    plans = await db.list_plans(True)
-    target = update.message or (update.callback_query.message if update.callback_query else None)
-    if not plans:
-        await target.reply_text(T.NO_PLANS)
-        return
+async def _show_or_edit(update, text, reply_markup=None) -> None:
+    """Edit the callback message, or reply when the entry was a text tap."""
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "📦 یه پلن انتخاب کن:", reply_markup=K.plans_kb(plans))
-    else:
-        await target.reply_text("📦 یه پلن انتخاب کن:", reply_markup=K.plans_kb(plans))
+        try:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+    target = update.message or (update.callback_query.message
+                                if update.callback_query else None)
+    await target.reply_text(text, reply_markup=reply_markup)
+
+
+async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Server picker (only reached when more than one panel can sell)."""
+    available = await db.list_available_panels()
+    if not available:
+        await _show_or_edit(update, T.NO_PANELS)
+        return
+    await _show_or_edit(update, T.PICK_SERVER,
+                        reply_markup=K.panels_kb(available))
+
+
+async def server_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """u:server:<pid> — remember the server, then show its plans."""
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[2])
+    p = await db.get_panel(pid)
+    if not p or not p.get("active") or not await db.panel_has_capacity(p):
+        await q.edit_message_text(T.PANEL_SOLD_OUT)
+        return
+    context.user_data["panel_id"] = pid
+    await show_plans(update, context, panel_id=pid)
+
+
+async def _chosen_panel(context) -> dict | None:
+    """The panel this purchase goes to: the picked server while it can
+    still sell, else the first available panel (None when all are full)."""
+    pid = context.user_data.get("panel_id")
+    if pid:
+        p = await db.get_panel(pid)
+        if p and p.get("active") and await db.panel_has_capacity(p):
+            return p
+    return await db.get_available_panel()
+
+
+async def show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     panel_id: int | None = None) -> None:
+    """Plan list for the purchase — after the server pick, if any.
+
+    With no sellable panel the user gets NO_PANELS; with exactly one,
+    its plans show directly; with several, the server picker comes
+    first. A stale stored panel (sold out / deleted) falls back to the
+    same count logic instead of breaking the flow.
+    """
+    plans = await db.list_plans(True)
+    if not plans:
+        await _show_or_edit(update, T.NO_PLANS)
+        return
+    if panel_id is None:
+        panel_id = context.user_data.get("panel_id")
+    panel = None
+    if panel_id:
+        p = await db.get_panel(panel_id)
+        if p and p.get("active") and await db.panel_has_capacity(p):
+            panel = p
+    if panel is None:
+        available = await db.list_available_panels()
+        if not available:
+            await _show_or_edit(update, T.NO_PANELS)
+            return
+        if len(available) == 1:
+            panel = available[0]
+        else:
+            context.user_data.pop("panel_id", None)
+            await _show_or_edit(update, T.PICK_SERVER,
+                                reply_markup=K.panels_kb(available))
+            return
+    context.user_data["panel_id"] = panel["id"]
+    multi = len(await db.list_available_panels()) > 1
+    await _show_or_edit(update, "📦 یه پلن انتخاب کن:",
+                        reply_markup=K.plans_kb(plans, show_server_back=multi))
 
 
 async def plan_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,6 +212,10 @@ async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not plan or not card_block:
         await q.edit_message_text(T.NO_CARD if not card_block else T.NO_PLANS)
         return
+    panel = await _chosen_panel(context)
+    if not panel:
+        await q.edit_message_text(T.NO_PANEL)
+        return
     guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
     head = f"{guide}\n\n" if guide else ""
     # State only after the screen was delivered: if the edit fails the
@@ -141,7 +224,8 @@ async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q.edit_message_text,
         f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
         f"💰 مبلغ: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}")
-    context.user_data["st"] = {"k": "receipt", "plan_id": pid, "kind": "purchase"}
+    context.user_data["st"] = {"k": "receipt", "plan_id": pid, "kind": "purchase",
+                               "panel_id": panel["id"]}
 
 
 async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
@@ -277,7 +361,7 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await q.edit_message_text(T.NO_PLANS)
         return
     uid = q.from_user.id
-    panel = await db.get_active_panel()
+    panel = await _chosen_panel(context)
     if not panel:
         await q.edit_message_text(T.NO_PANEL)
         return
@@ -289,7 +373,8 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     from handlers_admin import approve_invoice
     iid = await db.create_invoice(user_id=uid, kind="purchase",
                                   plan_id=plan["id"],
-                                  price_toman=plan["price_toman"])
+                                  price_toman=plan["price_toman"],
+                                  panel_id=panel["id"])
     try:
         res = await approve_invoice(context, await db.get_invoice(iid), None)
     except Exception as e:
@@ -322,8 +407,13 @@ async def crypto_buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not plan or not plan["active"]:
         await q.edit_message_text(T.NO_PLANS)
         return
+    panel = await _chosen_panel(context)
+    if not panel:
+        await q.edit_message_text(T.NO_PANEL)
+        return
     context.user_data["st"] = {"k": "crypto_cur", "flow": "buy",
-                               "plan_id": plan["id"]}
+                               "plan_id": plan["id"],
+                               "panel_id": panel["id"]}
     await q.edit_message_text(
         f"{T.plan_line(plan)}\n\n{T.CRYPTO_PICK_CURRENCY}",
         reply_markup=K.crypto_currency_kb(f"u:plan:{plan['id']}"))
@@ -462,6 +552,8 @@ async def crypto_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             sub_id=target.get("sub_id", ""),
             expires_at=target.get("expires_at", 0),
         )
+    elif st.get("panel_id"):
+        extra["panel_id"] = st["panel_id"]
     # best-effort: seed the ETH baseline for the keyless RPC backend
     try:
         backend = await chainwatch.get_backend()
@@ -619,6 +711,10 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, st
                                 panel_email=st.get("panel_email", ""),
                                 sub_id=st.get("sub_id", ""),
                                 expires_at=st.get("base_expires", 0))
+    elif st["kind"] == "purchase" and st.get("panel_id"):
+        # the server the customer picked — approve_invoice builds the
+        # client on this panel instead of the first active one
+        await db.update_invoice(iid, panel_id=st.get("panel_id"))
     context.user_data.pop("st", None)
     u = msg.from_user
     uname = f"@{u.username}" if u.username else str(u.id)
@@ -754,7 +850,7 @@ async def grant_test_account(context: ContextTypes.DEFAULT_TYPE,
         gb = float(await db.get_setting("test_gb", "2"))
     except (TypeError, ValueError):
         gb = 2.0
-    panel = await db.get_active_panel()
+    panel = await db.get_available_panel()
     if not panel:
         return "⚠️ پنل فعالی ثبت نشده."
     iid = await db.create_invoice(user_id=uid, kind="test", plan_id=None,
@@ -890,12 +986,35 @@ async def _handle_state(update: Update, context: ContextTypes.DEFAULT_TYPE, st: 
 
 
 # ---------------- callback router ----------------
+async def chklock_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """u:chklock — recheck membership after the user joined the channels."""
+    q = update.callback_query
+    await q.answer()
+    missing = await missing_lock_channels(context.bot, q.from_user.id)
+    if missing:
+        await show_channel_lock(q.message, missing)
+        return
+    await q.message.reply_text(
+        "✅ عضویتت تایید شد! از منوی زیر شروع کن 👇", reply_markup=_mm(update))
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     data = q.data or ""
     st = context.user_data.get("st") or {}
+    if data == "u:chklock":
+        await chklock_recheck(update, context)
+        return
+    # channel lock gates every user callback (admins are exempt inside);
+    # the lock's own recheck button above is the only exception
+    if await enforce_channel_lock(q.message, context, q.from_user.id):
+        return
     if data == "u:plans":
         await show_plans(update, context)
+    elif data == "u:servers":
+        await show_servers(update, context)
+    elif data.startswith("u:server:"):
+        await server_picked(update, context)
     elif data.startswith("u:plan:"):
         if st.get("k") == "renew_pick":
             await renew_plan_picked(update, context)

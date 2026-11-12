@@ -52,10 +52,19 @@ def back_admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔙 بازگشت به مدیریت", callback_data="adm_home")]])
 
 
-def plans_kb(plans: list[dict]) -> InlineKeyboardMarkup:
+def plans_kb(plans: list[dict], show_server_back: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         f"{p['name']} — {p['price_toman']:,} تومان", callback_data=f"u:plan:{p['id']}")]
         for p in plans]
+    if show_server_back:
+        rows.append([InlineKeyboardButton("◀️ انتخاب سرور", callback_data="u:servers")])
+    return InlineKeyboardMarkup(rows)
+
+
+def panels_kb(panels: list[dict]) -> InlineKeyboardMarkup:
+    """Server picker: one row per panel, by the name the admin set."""
+    rows = [[InlineKeyboardButton(f"🌐 {p['name']}", callback_data=f"u:server:{p['id']}")]
+            for p in panels]
     return InlineKeyboardMarkup(rows)
 
 

@@ -287,7 +287,7 @@ def test_buy_start_bad_plan_name_still_shows(dbpath):
     run(handlers_user.buy_start(_upd(q=q), ctx))
     assert q.edited and "ویژه" in q.edited[0]
     assert ctx.user_data["st"] == {"k": "receipt", "plan_id": 1,
-                                   "kind": "purchase"}
+                                   "kind": "purchase", "panel_id": 1}
 
 
 def test_buy_start_total_failure_sets_no_state(dbpath):

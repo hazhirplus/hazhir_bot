@@ -20,6 +20,7 @@ import backup
 import db
 import text as T
 import keyboards as K
+from channel_lock import channel_lock_list, parse_channel_lock_list
 from helpers import (admin_only, notify_admins, deliver_service,
                      panel_client_for, create_panel_client,
                      maybe_grant_referral_gift, send_md)
@@ -226,6 +227,11 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
         else await db.get_active_panel()
     if not panel:
         return "⚠️ پنل فعالی ثبت نشده."
+    if inv.get("kind") == "purchase" and not await db.panel_has_capacity(panel):
+        # the cap filled up between payment and approval: refuse to build
+        # a new client here; the invoice stays pending so the admin can
+        # reject it (wallet buys refund automatically on non-active)
+        return T.PANEL_CAP_FULL
     plan = await db.get_plan(inv["plan_id"]) if inv.get("plan_id") else None
     days = plan["days"] if plan else int(_to_float(await db.get_setting("test_days", "1"), 1))
     gb = plan["gb"] if plan else _to_float(await db.get_setting("test_gb", "2"), 2.0)
@@ -414,9 +420,15 @@ async def start_manual_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 @admin_only
 async def panels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     panels = await db.list_panels(False)
-    rows = [[InlineKeyboardButton(
-        f"{'🟢' if p['active'] else '⚪'} {p['name']}",
-        callback_data=f"adm_panel_view:{p['id']}")] for p in panels]
+    rows = []
+    for p in panels:
+        sold = await db.count_panel_sales(p["id"])
+        full = not await db.panel_has_capacity(p, sold=sold)
+        label = f"{'🟢' if p['active'] else '⚪'} {p['name']}"
+        if full:
+            label += " — 🔒 تکمیل ظرفیت"
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"adm_panel_view:{p['id']}")])
     rows.append([InlineKeyboardButton("➕ افزودن پنل", callback_data="adm_panel_add")])
     await _show(update, "🖥 پنل‌ها:", _with_back(rows))
 
@@ -427,13 +439,19 @@ async def panel_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pid: 
     if not p:
         await q.answer("یافت نشد.", show_alert=True)
         return
+    sold = await db.count_panel_sales(pid)
+    cap = db.cap_of(p)
+    cap_txt = f"{cap:,}" if cap else "نامحدود"
     txt = (f"🖥 {p['name']}\n🔗 {p['url']}\n"
            f"🔑 توکن: {config.mask_token(p['token'])}\n"
            f"📡 ساب: {p['sub_base'] or '—'}\n"
            f"🔌 اینباندها: {', '.join(map(str, p['inbounds'])) or '—'}\n"
+           f"📊 فروش: {sold:,} / {cap_txt}\n"
            f"{'🟢 فعال' if p['active'] else '⚪ غیرفعال'}")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔌 تست اتصال", callback_data=f"adm_panel_test:{pid}")],
+        [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"adm_panel_name:{pid}"),
+         InlineKeyboardButton("📊 سقف فروش", callback_data=f"adm_panel_cap:{pid}")],
         [InlineKeyboardButton("✏️ ویرایش توکن", callback_data=f"adm_panel_token:{pid}"),
          InlineKeyboardButton("✏️ ویرایش آدرس", callback_data=f"adm_panel_url:{pid}")],
         [InlineKeyboardButton("✏️ ویرایش ساب", callback_data=f"adm_panel_sub:{pid}")],
@@ -743,6 +761,10 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 @admin_only
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     auto_on = await backup.auto_backup_on()
+    chlock_on = await db.get_setting("channel_lock_enabled", "0") != "0"
+    chlock_n = len(await channel_lock_list())
+    chlock_label = (f"🔒 قفل کانال: {'✅ روشن' if chlock_on else '⚪️ خاموش'}"
+                    + (f" ({chlock_n} کانال)" if chlock_n else ""))
     kb = _with_back([
         [InlineKeyboardButton("💬 متن‌ها", callback_data="adm_set_texts"),
          InlineKeyboardButton("🎁 اکانت تست", callback_data="adm_set_test")],
@@ -751,11 +773,37 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [InlineKeyboardButton("📥 لینک دانلود برنامه‌ها", callback_data="adm_set_dl"),
          InlineKeyboardButton("👥 رفرال", callback_data="adm_set_ref")],
         [InlineKeyboardButton("💎 ارز دیجیتال", callback_data="adm_set_crypto")],
+        [InlineKeyboardButton(chlock_label, callback_data="adm_set_chlock")],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="adm_set_backup"),
          InlineKeyboardButton(f"💾 بکاپ خودکار: {'✅ روشن' if auto_on else '⚪️ خاموش'}",
                               callback_data="adm_set_autobackup")],
     ])
     await _show(update, "⚙️ تنظیمات:", kb)
+
+
+async def chlock_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Channel-lock settings: toggle + channel list (default OFF)."""
+    on = await db.get_setting("channel_lock_enabled", "0") != "0"
+    lst = await channel_lock_list()
+    lines = [f"🔒 قفل کانال: {'✅ روشن' if on else '⚪️ خاموش'}"]
+    if lst:
+        lines.append("\nکانال‌ها:")
+        for ch in lst:
+            lines.append(f"• {ch}")
+    else:
+        lines.append("\nهنوز کانالی تنظیم نشده — قفل تا وقتی لیست خالی است بی‌اثر است.")
+    if on and not lst:
+        lines.append("\n⚠️ قفل روشن است ولی لیست خالی است؛ اول کانال اضافه کن.")
+    lines.append("\nکاربر تا عضو همه کانال‌ها نباشد نمی‌تواند از ربات استفاده کند؛ ادمین‌ها معاف‌اند.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔒 قفل: {'✅ روشن' if on else '⚪️ خاموش'} — تغییر وضعیت",
+            callback_data="adm_set_chlock_tgl")],
+        [InlineKeyboardButton("✏️ تنظیم کانال‌ها",
+                              callback_data="adm_set_chlock_set")],
+        [InlineKeyboardButton("◀️ برگشت", callback_data="adm_set_home")],
+    ])
+    await _show(update, "\n".join(lines), kb)
 
 
 async def _setting_value(key: str) -> str:
@@ -806,27 +854,29 @@ async def settings_group(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 # ---------------- setup guide (first-run wizard) ----------------
 # Entry: "📖 آموزش راه‌اندازی" in the admin bottom menu. The wizard
-# walks a new admin through the first setup step by step — panel URL,
-# API token, sub base, inbounds, bank card — then tests the panel
-# connection. Every step can be skipped; answers are saved as they
+# walks a new admin through the first setup step by step — panel name,
+# panel URL, API token, sub base, inbounds, bank card — then tests the
+# panel connection. Every step can be skipped; answers are saved as they
 # come in, so leaving mid-way keeps the progress.
-SETUP_ORDER = ["url", "token", "sub", "inb", "card", "holder"]
+SETUP_ORDER = ["name", "url", "token", "sub", "inb", "card", "holder"]
 
 SETUP_PROMPTS = {
-    "url": ("🔗 قدم ۱ از ۶ — آدرس پنل چیه؟\n"
+    "name": ("🖥 قدم ۱ از ۷ — اسم این سرور چیه؟\n"
+             "مثلاً «سرور کانادا» — همین اسم موقع خرید به مشتری نشون داده می‌شه."),
+    "url": ("🔗 قدم ۲ از ۷ — آدرس پنل چیه؟\n"
             "مثلاً `https://host:port/base`\n"
             "همون آدرسی که باهاش وارد پنل 3x-ui می‌شی."),
-    "token": ("🔑 قدم ۲ از ۶ — توکن API پنل چیه؟\n"
+    "token": ("🔑 قدم ۳ از ۷ — توکن API پنل چیه؟\n"
               "از پنل: Settings ← API — یه توکن با دسترسی admin بساز و بفرست."),
-    "sub": ("📡 قدم ۳ از ۶ — بیس لینک ساب چیه؟\n"
+    "sub": ("📡 قدم ۴ از ۷ — بیس لینک ساب چیه؟\n"
             "مثلاً `https://host:2096/hard/`\n"
             "همون لینکی که توی پنل، بخش Subscription می‌بینی."),
-    "inb": ("🔌 قدم ۴ از ۶ — آیدی اینباندها چیه؟\n"
+    "inb": ("🔌 قدم ۵ از ۷ — آیدی اینباندها چیه؟\n"
             "با کاما جدا کن، مثلاً `1,9,11`.\n"
             "اگه هنوز اینباند نساختی، این قدم رو رد کن و بعداً از «📡 اینباندها» اضافه کن."),
-    "card": ("💳 قدم ۵ از ۶ — شماره کارتت چیه؟\n"
+    "card": ("💳 قدم ۶ از ۷ — شماره کارتت چیه؟\n"
              "همون کارتی که مشتری‌ها مبلغ رو بهش واریز می‌کنن."),
-    "holder": "👤 قدم ۶ از ۶ — نام صاحب کارت چیه؟",
+    "holder": "👤 قدم ۷ از ۷ — نام صاحب کارت چیه؟",
 }
 
 
@@ -891,7 +941,9 @@ async def _setup_ask(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Ask one wizard step; `carried` values travel in the state dict."""
     p = await db.get_active_panel()
     cur = ""
-    if step == "url" and p and p.get("url"):
+    if step == "name" and p and p.get("name"):
+        cur = f"\nفعلی: {p['name']}"
+    elif step == "url" and p and p.get("url"):
         cur = f"\nفعلی: {p['url']}"
     elif step == "token" and p and p.get("token"):
         cur = f"\nفعلی: {config.mask_token(p['token'])}"
@@ -913,6 +965,8 @@ async def _setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     p = await db.get_active_panel()
     cards = await db.list_cards(False)
     done = {
+        # the env-seeded default name is not a real choice yet
+        "name": bool(p and p.get("name") and p["name"] != "پنل اصلی"),
         "url": bool(p and p.get("url")),
         "token": bool(p and p.get("token")),
         "sub": bool(p and p.get("sub_base")),
@@ -928,6 +982,8 @@ async def _setup_save_panel(st: dict, inb: list[int]) -> None:
     """Persist the wizard's panel answers (create or update the active panel)."""
     p = await db.get_active_panel()
     fields = {"inbounds_json": json.dumps(sorted(set(inb)))}
+    if st.get("name"):
+        fields["name"] = st["name"]
     if st.get("url"):
         fields["url"] = st["url"]
     if st.get("token"):
@@ -937,8 +993,9 @@ async def _setup_save_panel(st: dict, inb: list[int]) -> None:
     if p:
         await db.update_panel(p["id"], **fields)
     else:
-        await db.add_panel("پنل اصلی", st.get("url", ""), st.get("token", ""),
-                           st.get("sub", ""), sorted(set(inb)))
+        await db.add_panel(st.get("name") or "پنل اصلی", st.get("url", ""),
+                           st.get("token", ""), st.get("sub", ""),
+                           sorted(set(inb)))
 
 
 async def _setup_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -956,7 +1013,7 @@ async def _setup_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     cards = await db.list_cards(False)
     plans = await db.list_plans(False)
     text = ("🎉 راه‌اندازی کامل شد!\n\n"
-            f"🖥 پنل: {p['url']}\n"
+            f"🖥 پنل: {p['name']} ({p['url']})\n"
             f"📡 اینباندها: {', '.join(map(str, p['inbounds'])) or '—'}\n"
             f"💳 کارت: {len(cards)} عدد\n"
             f"📦 پلن: {len(plans)} عدد (قیمت‌ها رو از «📦 پلن‌ها» عوض کن)\n\n"
@@ -971,7 +1028,12 @@ async def _setup_answer(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """One wizard answer: validate, save, advance. `st` is user_data['st']."""
     msg = update.message
     carried = {k: v for k, v in st.items() if k != "k"}
-    if step == "url":
+    if step == "name":
+        if not txt:
+            await msg.reply_text("❌ اسم خالیه — یه اسم بفرست:")
+            return
+        carried["name"] = txt[:60]
+    elif step == "url":
         if not txt or not txt.startswith(("http://", "https://")):
             await msg.reply_text(
                 "❌ آدرس معتبر نیست — باید با http:// یا https:// شروع بشه. "
@@ -1144,6 +1206,36 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await db.update_panel(st["pid"], sub_base=txt.rstrip("/"))
             context.user_data.pop("st", None)
             await msg.reply_text("✅ بیس ساب به‌روز شد.")
+        elif k == "a_pname":
+            name = txt[:60]
+            if not name:
+                await msg.reply_text("❌ نام خالیه — یه اسم بفرست:")
+                return True
+            await db.update_panel(st["pid"], name=name)
+            context.user_data.pop("st", None)
+            await msg.reply_text(f"✅ نام پنل شد «{name}».")
+        elif k == "a_pcap":
+            # 0 / empty = unlimited (stored as NULL)
+            if txt in ("0", "۰", "نامحدود", "—", ""):
+                n = None
+            else:
+                n = _num(txt)
+                if n is None or n < 0:
+                    await msg.reply_text("❌ یه عدد بفرست — صفر یعنی نامحدود:")
+                    return True
+                n = n or None
+            await db.update_panel(st["pid"], sales_cap=n)
+            context.user_data.pop("st", None)
+            await msg.reply_text("✅ سقف فروش برداشته شد — نامحدود."
+                                 if n is None else
+                                 f"✅ سقف فروش شد {n:,} کانفیگ.")
+        elif k == "a_chlock_set":
+            lst = parse_channel_lock_list(txt)
+            await db.set_setting("channel_lock_list",
+                                 json.dumps(lst, ensure_ascii=False))
+            context.user_data.pop("st", None)
+            await msg.reply_text(f"✅ {len(lst)} کانال ثبت شد."
+                                 if lst else "✅ لیست کانال‌ها خالی شد.")
         elif k == "a_inbadd":
             p = await db.get_panel(st["pid"])
             inb = p["inbounds"] + [int(txt)] if txt.isdigit() else p["inbounds"]
@@ -1456,6 +1548,13 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await panels_menu(update, context)
         elif data == "adm_panel_add":
             await ask_state(update, context, "a_padd_name", "📝 نام پنل؟")
+        elif data.startswith("adm_panel_name:"):
+            await ask_state(update, context, "a_pname", "📝 نام جدید پنل؟",
+                            pid=int(parts[1]))
+        elif data.startswith("adm_panel_cap:"):
+            await ask_state(update, context, "a_pcap",
+                            "📊 سقف فروش این پنل چندتا باشه؟\n"
+                            "صفر یعنی نامحدود.", pid=int(parts[1]))
         elif data.startswith("adm_panel_token:"):
             await ask_state(update, context, "a_ptoken", "🔑 توکن جدید؟",
                             pid=int(parts[1]))
@@ -1615,6 +1714,17 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await db.set_setting(backup.AUTO_BACKUP_KEY,
                                  "0" if cur else "1")
             await settings_menu(update, context)
+        elif data == "adm_set_chlock":
+            await chlock_view(update, context)
+        elif data == "adm_set_chlock_tgl":
+            cur = await db.get_setting("channel_lock_enabled", "0")
+            await db.set_setting("channel_lock_enabled",
+                                 "0" if cur != "0" else "1")
+            await chlock_view(update, context)
+        elif data == "adm_set_chlock_set":
+            await ask_state(update, context, "a_chlock_set",
+                            "📣 کانال‌ها رو بفرست — با کاما یا خط جدید جدا کن "
+                            "(مثلاً @a, @b).\n«پاک» یعنی خالی کردن لیست.")
         elif data.startswith("adm_set_toggle:"):
             key = parts[1]
             group = parts[2] if len(parts) > 2 else "test"

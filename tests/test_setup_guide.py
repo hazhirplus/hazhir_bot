@@ -144,11 +144,15 @@ def test_wizard_full_flow(dbpath, monkeypatch):
 
     monkeypatch.setattr(ha, "panel_client_for", lambda p: FakePanel())
     ctx = _ctx(FakeBot())
-    ctx.user_data["st"] = {"k": "a_setup_url"}
+    ctx.user_data["st"] = {"k": "a_setup_name"}
+
+    upd = _answer(ha, ctx, "سرور کانادا")
+    assert ctx.user_data["st"]["k"] == "a_setup_url"
+    assert "قدم ۲" in upd.message.replies[-1][0]
 
     upd = _answer(ha, ctx, "https://panel.example:8443/web")
     assert ctx.user_data["st"]["k"] == "a_setup_token"
-    assert "قدم ۲" in upd.message.replies[-1][0]
+    assert "قدم ۳" in upd.message.replies[-1][0]
 
     upd = _answer(ha, ctx, "tok123")
     assert ctx.user_data["st"]["k"] == "a_setup_sub"
@@ -159,6 +163,7 @@ def test_wizard_full_flow(dbpath, monkeypatch):
     upd = _answer(ha, ctx, "1,9,11")
     assert ctx.user_data["st"]["k"] == "a_setup_card"
     panel = run(db.get_active_panel(path=dbpath))
+    assert panel["name"] == "سرور کانادا"
     assert panel["url"] == "https://panel.example:8443/web"
     assert panel["token"] == "tok123"
     assert panel["sub_base"] == "https://panel.example:2096/hard"
@@ -207,11 +212,11 @@ def test_wizard_skip_all(dbpath, monkeypatch):
     ctx = _ctx(FakeBot())
     msg = FakeMsg()
 
-    # start: first incomplete step is the URL
+    # start: first incomplete step is the name
     run(ha.on_admin_callback(_cb_update("adm_setup_start", msg), ctx))
-    assert ctx.user_data["st"]["k"] == "a_setup_url"
+    assert ctx.user_data["st"]["k"] == "a_setup_name"
 
-    for step in ("url", "token", "sub", "inb", "card"):
+    for step in ("name", "url", "token", "sub", "inb", "card"):
         run(ha.on_admin_callback(_cb_update(f"adm_setup_skip:{step}", msg),
                                  ctx))
     # skipping the card jumps straight to the test; no panel exists
@@ -245,11 +250,13 @@ def test_wizard_updates_existing_panel(dbpath, monkeypatch):
     assert len(panels) == 1  # env-seeded «پنل اصلی»
     ctx = _ctx(FakeBot())
 
-    # start: everything is already set, so it redoes from the URL
+    # start: the env-seeded default name («پنل اصلی») counts as unset,
+    # so the wizard begins at the name step, then redoes the rest
     run(ha.on_admin_callback(
         _cb_update("adm_setup_start", FakeMsg()), ctx))
-    assert ctx.user_data["st"]["k"] == "a_setup_url"
+    assert ctx.user_data["st"]["k"] == "a_setup_name"
 
+    _answer(ha, ctx, "سرور جدید")
     _answer(ha, ctx, "https://new.example:8443/panel")
     _answer(ha, ctx, "newtok")
     _answer(ha, ctx, "https://new.example:2096/hard/")
@@ -258,6 +265,7 @@ def test_wizard_updates_existing_panel(dbpath, monkeypatch):
     assert "st" not in ctx.user_data
     panels = run(db.list_panels(False, path=dbpath))
     assert len(panels) == 1  # updated in place, not duplicated
+    assert panels[0]["name"] == "سرور جدید"
     assert panels[0]["url"] == "https://new.example:8443/panel"
     assert panels[0]["token"] == "newtok"
     assert panels[0]["inbounds"] == [2, 3]

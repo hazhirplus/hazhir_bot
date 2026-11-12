@@ -19,9 +19,9 @@ A Persian Telegram bot for selling VPN subscriptions via a **3x-ui** panel — p
 
 ### امکانات
 
-**مشتری:** خرید سرویس (کیف پول / کارت‌به‌کارت با تأیید مدیر / ارز دیجیتال اختیاری) ← تحویل خودکار لینک اشتراک + QR · سرویس‌های من (حجم و روزهای باقی‌مانده، زنده از پنل) · کیف پول · اکانت تست (یک بار، بدون تأیید مدیر) · دعوت دوستان (با اولین خرید دعوت‌شده، یک سرویس هدیه) · آموزش اتصال اندروید / آیفون / ویندوز · پشتیبانی.
+**مشتری:** خرید سرویس (انتخاب سرور با اسم، کیف پول / کارت‌به‌کارت با تأیید مدیر / ارز دیجیتال اختیاری) ← تحویل خودکار لینک اشتراک + QR · سرویس‌های من (حجم و روزهای باقی‌مانده، زنده از پنل) · کیف پول · اکانت تست (یک بار، بدون تأیید مدیر) · دعوت دوستان (با اولین خرید دعوت‌شده، یک سرویس هدیه) · آموزش اتصال اندروید / آیفون / ویندوز · پشتیبانی.
 
-**مدیر (دکمه 🛠 مدیریت در منوی پایین — نه دستور):** گزارش‌ها · پرداخت‌های در انتظار با تأیید/رد و تشخیص فیش تکراری · مدیریت پنل (آدرس، توکن، ساب، تست اتصال) · اینباندها (با مرجع از روی کانفیگ) · پلن‌ها · کارت‌ها · کاربران · آموزش‌ها · پیام همگانی · تنظیمات گروه‌بندی‌شده · **📖 آموزش راه‌اندازی** — ویزارد قدم‌به‌قدم برای تنظیم اولیه.
+**مدیر (دکمه 🛠 مدیریت در منوی پایین — نه دستور):** گزارش‌ها · پرداخت‌های در انتظار با تأیید/رد و تشخیص فیش تکراری · مدیریت پنل (نام سرور، آدرس، توکن، ساب، سقف فروش، تست اتصال) · اینباندها (با مرجع از روی کانفیگ) · پلن‌ها · کارت‌ها · کاربران · آموزش‌ها · پیام همگانی · تنظیمات گروه‌بندی‌شده (شامل 🔒 قفل کانال) · **📖 آموزش راه‌اندازی** — ویزارد قدم‌به‌قدم برای تنظیم اولیه.
 
 **خودکار:** هر ساعت هشدار انقضا و اتمام حجم (پیش‌فرض ۸۰٪ مصرف) + غیرفعال‌سازی سرویس‌های منقضی · روزانه ۰۹:۰۰ تهران گزارش فروش · هر ۳ دقیقه بررسی پرداخت کریپتو (فقط وقتی فعال باشد).
 
@@ -75,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/hazhirplus/hazhir_bot/main/install.
 #### قدم ۵ — اولین ورود و راه‌اندازی از داخل ربات
 
 1. به رباتت `/start` بزن، بعد دکمه‌ی **🛠 مدیریت** در منوی پایین.
-2. دکمه‌ی **📖 آموزش راه‌اندازی** را بزن — قدم‌به‌قدم آدرس پنل، توکن، بیس ساب، اینباندها و کارت را ازت می‌گیرد و آخرش اتصال به پنل را تست می‌کند. هر قدم را می‌توانی رد کنی.
+2. دکمه‌ی **📖 آموزش راه‌اندازی** را بزن — قدم‌به‌قدم اسم سرور، آدرس پنل، توکن، بیس ساب، اینباندها و کارت را ازت می‌گیرد و آخرش اتصال به پنل را تست می‌کند. هر قدم را می‌توانی رد کنی.
 3. از «📦 پلن‌ها» قیمت ۴ پلن پیش‌فرض (۱۰ / ۳۰ / ۵۰ / ۸۰ گیگ، ۳۰ روزه) را به قیمت خودت عوض کن.
 4. یک خرید آزمایشی با یک اکانت تلگرام دیگر بگیر.
 
@@ -134,7 +134,7 @@ AGPL-3.0 — فایل `LICENSE` را ببینید.
 
 **Customers:** buy a service (wallet / card-to-card with admin approval / optional crypto) → automatic subscription link + QR delivery · My services (live remaining volume and days from the panel) · wallet · trial account (once, no approval) · referrals (first purchase of an invitee creates a gift service) · Android / iPhone / Windows connection guides · support.
 
-**Admins (🛠 management button in the bottom menu — never a command):** reports · pending payments with approve/reject and duplicate-receipt warnings · panel management (address, token, sub-link, connection test) · inbounds (with a reference client) · plans · cards · users · tutorials · broadcast · grouped settings · **📖 setup guide** — a step-by-step wizard for the first setup.
+**Admins (🛠 management button in the bottom menu — never a command):** reports · pending payments with approve/reject and duplicate-receipt warnings · panel management (server name, address, token, sub-link, sales cap, connection test) · inbounds (with a reference client) · plans · cards · users · tutorials · broadcast · grouped settings (including 🔒 channel lock) · **📖 setup guide** — a step-by-step wizard for the first setup.
 
 **Automatic:** hourly expiry and volume warnings (default at 80% used) + disabling expired services · daily 09:00 Tehran sales report · crypto payment checks every 3 minutes (only when enabled).
 

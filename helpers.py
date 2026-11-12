@@ -136,7 +136,7 @@ async def activate_crypto_invoice(context: ContextTypes.DEFAULT_TYPE,
 async def deliver_service(context: ContextTypes.DEFAULT_TYPE, invoice: dict) -> bool:
     """Send subscription URL + links + QR to the user. Returns success."""
     panel = await db.get_panel(invoice["panel_id"]) if invoice.get("panel_id") \
-        else await db.get_active_panel()
+        else await db.get_available_panel()
     if not panel:
         return False
     plan = await db.get_plan(invoice["plan_id"]) if invoice.get("plan_id") else None
@@ -306,7 +306,7 @@ async def maybe_grant_referral_gift(context: ContextTypes.DEFAULT_TYPE, inv: dic
         gb = _to_float(await db.get_setting("ref_gift_gb", "10"), 10.0)
     except (TypeError, ValueError):
         days, gb = 30, 10.0
-    panel = await db.get_active_panel()
+    panel = await db.get_available_panel()
     if not panel:
         log.warning("referral gift skipped: no active panel")
         return

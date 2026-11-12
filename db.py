@@ -91,6 +91,7 @@ async def init_db(path: str | None = None) -> None:
         for table, col, ddl in (
             ("users", "referred_by", "INTEGER DEFAULT NULL"),
             ("users", "balance_toman", "INTEGER NOT NULL DEFAULT 0"),
+            ("panels", "sales_cap", "INTEGER DEFAULT NULL"),
             ("invoices", "pay_method", "TEXT DEFAULT 'card'"),
             ("invoices", "crypto_chain", "TEXT DEFAULT ''"),
             ("invoices", "crypto_currency", "TEXT DEFAULT ''"),
@@ -270,6 +271,58 @@ async def get_active_panel(path: str | None = None):
     return panels[0] if panels else None
 
 
+async def count_panel_sales(pid: int, path: str | None = None) -> int:
+    """Delivered purchases on this panel (active or expired).
+
+    Only paid purchases count toward the sales cap: a renewal extends an
+    existing client (no new config), and test/gift accounts are free.
+    Pending invoices don't count — nothing was delivered yet.
+    """
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        cur = await con.execute(
+            "SELECT COUNT(*) FROM invoices WHERE panel_id=? "
+            "AND kind='purchase' AND status IN ('active','expired')",
+            (pid,),
+        )
+        return (await cur.fetchone())[0]
+
+
+def cap_of(panel: dict) -> int | None:
+    """The panel's sales cap: None means unlimited (NULL, 0 or garbage)."""
+    try:
+        cap = int(panel.get("sales_cap"))
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+async def panel_has_capacity(panel: dict, path: str | None = None,
+                             sold: int | None = None) -> bool:
+    """True when the panel can still sell (no cap, or sold < cap)."""
+    cap = cap_of(panel)
+    if cap is None:
+        return True
+    if sold is None:
+        sold = await count_panel_sales(panel["id"], path)
+    return sold < cap
+
+
+async def list_available_panels(path: str | None = None) -> list[dict]:
+    """Active panels that can still sell (cap not reached), by id."""
+    out = []
+    for p in await list_panels(True, path):
+        if await panel_has_capacity(p, path):
+            out.append(p)
+    return out
+
+
+async def get_available_panel(path: str | None = None):
+    """First panel a new sale can go to (None when every panel is full)."""
+    panels = await list_available_panels(path)
+    return panels[0] if panels else None
+
+
 async def add_panel(name, url, token, sub_base, inbounds, path: str | None = None) -> int:
     path = path or config.DB_PATH
     async with aiosqlite.connect(path) as con:
@@ -283,7 +336,8 @@ async def add_panel(name, url, token, sub_base, inbounds, path: str | None = Non
 
 
 async def update_panel(pid: int, path: str | None = None, **fields) -> None:
-    allowed = {"name", "url", "token", "sub_base", "inbounds_json", "active"}
+    allowed = {"name", "url", "token", "sub_base", "inbounds_json", "active",
+               "sales_cap"}
     sets, vals = [], []
     for k, v in fields.items():
         if k in allowed:
