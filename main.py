@@ -71,6 +71,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     st = context.user_data.get("st")
     if st:
+        if st.get("k") == "receipt" and await _receipt_lock_blocked(
+                update, context):
+            return
         await _handle_state(update, context, st)
         return
     t = (update.message.text or "").strip()
@@ -79,12 +82,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await menu_text(update, context)
 
 
+from channel_lock import enforce_channel_lock
+
+
+async def _receipt_lock_blocked(update, context) -> bool:
+    """True when the user has a receipt state but fails the channel lock.
+
+    Receipts arrive as a photo (on_media) or as a typed tracking number
+    (on_text) — both paths must check the lock, or a user who grabbed
+    the receipt state before the lock was turned on (or left the
+    channels since) can use the bot without joining (N4a).
+    """
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is None:
+        return False
+    return await enforce_channel_lock(update.message, context, uid)
+
+
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = context.user_data.get("st")
     if not st:
         return
     k = st.get("k")
     if k == "receipt":
+        if await _receipt_lock_blocked(update, context):
+            return
         await _handle_state(update, context, st)
     elif k in ("a_tutadd_photo", "a_tutedit", "a_bc_msg"):
         from handlers_admin import handle_admin_state

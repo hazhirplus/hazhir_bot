@@ -183,8 +183,11 @@ def test_wallet_buy_panel_failure_refunds(dbpath, monkeypatch):
     ctx = SimpleNamespace(bot=FakeBot(), user_data={})
     run(handlers_user.wallet_buy(_upd(q=q, uid=uid), ctx))
     assert run(db.get_balance(uid)) == plan["price_toman"]  # refunded
-    invs = run(db.user_invoices(uid, ("pending", "active", "expired")))
-    assert invs and invs[0]["status"] != "active"
+    # N6: a refunded wallet invoice is auto-rejected, not left pending
+    # in the admin queue (where approving it would hand out a free
+    # service for money already refunded).
+    invs = run(db.user_invoices(uid, ("rejected",)))
+    assert invs and invs[0]["status"] == "rejected"
     assert any("برگشت" in t for t in q.edited)
 
 

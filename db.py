@@ -272,17 +272,19 @@ async def get_active_panel(path: str | None = None):
 
 
 async def count_panel_sales(pid: int, path: str | None = None) -> int:
-    """Delivered purchases on this panel (active or expired).
+    """Delivered clients on this panel (active or expired).
 
-    Only paid purchases count toward the sales cap: a renewal extends an
-    existing client (no new config), and test/gift accounts are free.
-    Pending invoices don't count — nothing was delivered yet.
+    Purchases, referral gifts and test accounts all occupy a client
+    slot on the panel, so they all count toward the sales cap (N2);
+    a renewal extends an existing client (no new config). Pending
+    invoices don't count — nothing was delivered yet.
     """
     path = path or config.DB_PATH
     async with aiosqlite.connect(path) as con:
         cur = await con.execute(
             "SELECT COUNT(*) FROM invoices WHERE panel_id=? "
-            "AND kind='purchase' AND status IN ('active','expired')",
+            "AND kind IN ('purchase','gift','test')"
+            " AND status IN ('active','expired')",
             (pid,),
         )
         return (await cur.fetchone())[0]

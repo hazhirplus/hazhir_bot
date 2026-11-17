@@ -345,9 +345,15 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # approve_invoice leaves a failed invoice "pending" (it never sets
     # "expired") — refund whenever the service did not become active,
     # or the wallet keeps money for a service that was never created.
+    # The refunded invoice is also auto-rejected (N6): leaving it
+    # pending would keep it in the admin queue, where approving it
+    # later would hand out a free service for money already refunded.
     if inv["status"] != "active":
         await db.add_balance(uid, plan["price_toman"])
-        await q.edit_message_text(f"⚠️ {res}\nمبلغ به کیف پولت برگشت.")
+        await db.update_invoice(iid, status="rejected")
+        await db.set_payment(iid, "rejected", None)
+        await q.edit_message_text(
+            f"⚠️ {res}\nمبلغ به کیف پولت برگشت. فاکتور بسته شد.")
         return
     await q.edit_message_text(f"👜 {res}")
 
@@ -384,9 +390,15 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # approve_invoice leaves a failed invoice "pending" (it never sets
     # "expired") — refund whenever the service did not become active,
     # or the wallet keeps money for a service that was never created.
+    # The refunded invoice is also auto-rejected (N6): leaving it
+    # pending would keep it in the admin queue, where approving it
+    # later would hand out a free service for money already refunded.
     if inv["status"] != "active":
         await db.add_balance(uid, plan["price_toman"])
-        await q.edit_message_text(f"⚠️ {res}\nمبلغ به کیف پولت برگشت.")
+        await db.update_invoice(iid, status="rejected")
+        await db.set_payment(iid, "rejected", None)
+        await q.edit_message_text(
+            f"⚠️ {res}\nمبلغ به کیف پولت برگشت. فاکتور بسته شد.")
         return
     await q.edit_message_text(f"👜 {res}")
 
@@ -992,7 +1004,7 @@ async def chklock_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await q.answer()
     missing = await missing_lock_channels(context.bot, q.from_user.id)
     if missing:
-        await show_channel_lock(q.message, missing)
+        await show_channel_lock(q.message, missing, context.bot)
         return
     await q.message.reply_text(
         "✅ عضویتت تایید شد! از منوی زیر شروع کن 👇", reply_markup=_mm(update))

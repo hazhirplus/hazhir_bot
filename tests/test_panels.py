@@ -1,7 +1,8 @@
 """Multi-panel: server names, per-panel sales cap, server picker at buy time.
 
 - panels.sales_cap (NULL = unlimited), counted sales = delivered
-  purchase invoices only (renewals extend a client, tests/gifts are free)
+  clients (purchase + gift + test; renewals extend a client, so they
+  don't count; pending invoices don't count either)
 - buy flow: no sellable panel -> NO_PANELS; one -> plans directly;
   several -> server picker first, then plans for that server
 - approve_invoice refuses a new client on a capped-out panel
@@ -148,7 +149,7 @@ def test_cap_of_treats_zero_and_negative_as_unlimited():
     assert db.cap_of({"sales_cap": 50}) == 50
 
 
-def test_count_panel_sales_only_delivered_purchases(dbpath):
+def test_count_panel_sales_counts_delivered_clients(dbpath):
     pid = _seed_panel(path=dbpath)
     _seed_plan(path=dbpath)
     _invoice(pid, "purchase", "active", dbpath)
@@ -157,7 +158,37 @@ def test_count_panel_sales_only_delivered_purchases(dbpath):
     _invoice(pid, "renew", "active", dbpath)
     _invoice(pid, "test", "active", dbpath)
     _invoice(pid, "gift", "active", dbpath)
-    assert run(db.count_panel_sales(pid, path=dbpath)) == 2
+    # N2: a gift and a test account occupy a client slot on the panel,
+    # so they count toward the cap; renewals and pending invoices don't.
+    assert run(db.count_panel_sales(pid, path=dbpath)) == 4
+
+
+def test_gift_and_test_fill_the_cap(dbpath):
+    pid = _seed_panel("پر", cap=1, path=dbpath)
+    _seed_plan(path=dbpath)
+    _invoice(pid, "gift", "active", dbpath)  # the single slot is taken
+    assert run(db.panel_has_capacity(
+        run(db.get_panel(pid, path=dbpath)), path=dbpath)) is False
+    assert run(db.list_available_panels(path=dbpath)) == []
+    assert run(db.get_available_panel(path=dbpath)) is None
+
+
+def test_referral_gift_skipped_when_all_panels_full(dbpath):
+    """N2: maybe_grant_referral_gift uses get_available_panel, so on a
+    full panel no gift client is created and the referral stays pending."""
+    import helpers
+    pid = _seed_panel("پر", cap=1, path=dbpath)
+    _seed_plan(path=dbpath)
+    run(db.upsert_user(111, "referrer", path=dbpath))
+    run(db.upsert_user(222, "referred", path=dbpath))
+    _invoice(pid, "purchase", "active", dbpath)  # cap reached
+    assert run(db.attribute_referral(222, 111, path=dbpath)) is True
+    iid = run(db.create_invoice(user_id=222, kind="purchase", plan_id=1,
+                                price_toman=90000, path=dbpath))
+    run(db.update_invoice(iid, path=dbpath, panel_id=pid, status="active"))
+    run(helpers.maybe_grant_referral_gift(_ctx(), run(db.get_invoice(iid, path=dbpath))))
+    assert run(db.list_invoices(kind="gift", path=dbpath)) == []
+    assert run(db.get_pending_referral(222, path=dbpath)) is not None
 
 
 def test_panel_capacity_and_available_list(dbpath):

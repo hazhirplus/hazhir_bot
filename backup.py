@@ -1,9 +1,9 @@
 """Nightly DB backup for «هژیر وی پی ان» (user request 2026-11-12).
 
-Every night at 00:00 Tehran the bot sends the database file to the admins
-inside the bot itself, so a dead server or a server move doesn't mean
-re-entering everything from zero. A manual backup button + an auto-backup
-toggle live in the admin settings menu.
+Every night at 00:00 Tehran the bot sends the database file to the
+primary admin inside the bot itself, so a dead server or a server move
+doesn't mean re-entering everything from zero. A manual backup button
++ an auto-backup toggle live in the admin settings menu.
 
 Design notes:
 - Scheduling uses PTB job_queue.run_daily (00:00 Asia/Tehran) — no manual
@@ -117,14 +117,21 @@ async def backup_caption(path: str | None = None) -> str:
 
 async def send_backup_to_admins(bot, db_path: str | None = None,
                                 dest_dir: str | None = None) -> int:
-    """بکاپ می‌گیرد و فایل را برای همه ادمین‌ها می‌فرستد. برمی‌گرداند تعداد
-    ارسال‌های موفق (۰ یعنی بکاپ ساخته نشد یا ادمینی نیست)."""
+    """بکاپ می‌گیرد و فایل را فقط برای ادمین اصلی (اولین ADMIN_IDS)
+    می‌فرستد. برمی‌گرداند تعداد ارسال‌های موفق (۰ یعنی بکاپ ساخته نشد
+    یا ادمینی نیست).
+
+    N3: the full .db contains panel tokens, card numbers and every
+    user/invoice — sending it unencrypted to every admin would leave
+    a copy in each admin's chat history forever. Only the owner gets
+    it; encryption/key management is a later step, not added here.
+    """
     out = await asyncio.to_thread(backup_db_file, db_path, dest_dir)
     if not out:
         return 0
     cap = await backup_caption(db_path)
     sent = 0
-    for aid in config.ADMIN_IDS:
+    for aid in config.ADMIN_IDS[:1]:
         try:
             with open(out, "rb") as f:
                 await bot.send_document(aid, f,

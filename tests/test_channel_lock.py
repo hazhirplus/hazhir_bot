@@ -17,7 +17,8 @@ import config
 import db
 from channel_lock import (parse_channel_lock_list, channel_lock_list,
                           channel_lock_active, missing_lock_channels,
-                          lock_join_rows, enforce_channel_lock)
+                          lock_join_rows, show_channel_lock,
+                          enforce_channel_lock)
 
 
 def run(coro):
@@ -43,16 +44,23 @@ class FakeMsg:
 
 
 class FakeBot:
-    def __init__(self, statuses=None, fail_on=()):
+    def __init__(self, statuses=None, fail_on=(), chats=None):
         # statuses: {channel: status}; fail_on: channels raising an error
+        # chats: {chat_id: SimpleNamespace(username=..., invite_link=...)}
         self.statuses = statuses or {}
         self.fail_on = set(fail_on)
+        self.chats = chats or {}
         self.sent = []
 
     async def get_chat_member(self, chat_id, user_id):
         if chat_id in self.fail_on:
             raise RuntimeError("Forbidden: bot is not an admin")
         return SimpleNamespace(status=self.statuses.get(chat_id, "left"))
+
+    async def get_chat(self, chat_id):
+        if chat_id in self.chats:
+            return self.chats[chat_id]
+        raise RuntimeError("Chat not found")
 
     async def send_message(self, chat_id, text, reply_markup=None,
                            parse_mode=None):
@@ -121,11 +129,41 @@ def test_get_chat_member_error_is_fail_closed(dbpath):
 
 
 def test_lock_join_rows_only_username_channels_get_links():
-    kb = lock_join_rows(["@a", "-100123"])
+    kb = run(lock_join_rows(FakeBot(), ["@a", "-100123"]))
     rows = kb.inline_keyboard
     assert rows[0][0].url == "https://t.me/a"
     assert len(rows) == 2  # one join button + recheck
     assert rows[1][0].callback_data == "u:chklock"
+
+
+# ---------------- numeric-id channels (N4b) ----------------
+def test_lock_join_rows_numeric_channel_with_invite_link():
+    bot = FakeBot(chats={"-100123": SimpleNamespace(
+        username=None, invite_link="https://t.me/+abc123")})
+    kb = run(lock_join_rows(bot, ["-100123"]))
+    rows = kb.inline_keyboard
+    assert rows[0][0].url == "https://t.me/+abc123"
+    assert rows[0][0].text == "📣 عضویت در -100123"
+
+
+def test_lock_join_rows_numeric_public_channel_uses_username():
+    bot = FakeBot(chats={"-100123": SimpleNamespace(
+        username="mychannel", invite_link=None)})
+    kb = run(lock_join_rows(bot, ["-100123"]))
+    assert kb.inline_keyboard[0][0].url == "https://t.me/mychannel"
+
+
+def test_lock_join_rows_numeric_unreachable_channel_no_button(dbpath):
+    """No invite link and get_chat fails: no button, but the lock message
+    still shows the id with guidance — no UX dead end."""
+    _enable(["-100123"], dbpath)
+    msg = FakeMsg()
+    run(show_channel_lock(msg, ["-100123"], FakeBot()))
+    text, kb = msg.replies[-1]
+    assert "-100123" in text
+    assert "دکمه ندارد" in text
+    assert all(b.url is None for row in kb.inline_keyboard for b in row)
+    assert kb.inline_keyboard[-1][0].callback_data == "u:chklock"
 
 
 # ---------------- enforcement ----------------
@@ -159,3 +197,69 @@ def test_enforce_inactive_lock_passes_everyone(dbpath):
     bot = FakeBot({"@a": "left"})
     msg = FakeMsg()
     assert run(enforce_channel_lock(msg, _ctx(bot), 111)) is False
+
+
+# ---------------- receipt path must not bypass the lock (N4a) ----------------
+def _receipt_ctx(bot):
+    ctx = _ctx(bot)
+    ctx.user_data["st"] = {"k": "receipt", "iid": 1}
+    return ctx
+
+
+def test_receipt_photo_blocked_by_channel_lock(dbpath, monkeypatch):
+    """on_media: a receipt photo from a non-member is rejected — the
+    receipt state must not bypass the channel lock."""
+    import main as main_mod
+    _enable(["@a"], dbpath)
+    bot = FakeBot({"@a": "left"})
+    msg = FakeMsg()
+    upd = SimpleNamespace(message=msg,
+                          effective_user=SimpleNamespace(id=111))
+    calls = []
+
+    async def fake_handle_state(update, context, st):
+        calls.append(st)
+
+    monkeypatch.setattr(main_mod, "_handle_state", fake_handle_state)
+    run(main_mod.on_media(upd, _receipt_ctx(bot)))
+    assert calls == []
+    assert msg.replies and "🔒" in msg.replies[-1][0]
+
+
+def test_receipt_photo_passes_for_member(dbpath, monkeypatch):
+    import main as main_mod
+    _enable(["@a"], dbpath)
+    bot = FakeBot({"@a": "member"})
+    msg = FakeMsg()
+    upd = SimpleNamespace(message=msg,
+                          effective_user=SimpleNamespace(id=111))
+    calls = []
+
+    async def fake_handle_state(update, context, st):
+        calls.append(st)
+
+    monkeypatch.setattr(main_mod, "_handle_state", fake_handle_state)
+    run(main_mod.on_media(upd, _receipt_ctx(bot)))
+    assert len(calls) == 1 and calls[0]["k"] == "receipt"
+    assert msg.replies == []
+
+
+def test_receipt_tracking_text_blocked_by_channel_lock(dbpath, monkeypatch):
+    """on_text: the same hole exists for a typed tracking number — the
+    lock is checked there too (extension beyond the letter of N4)."""
+    import main as main_mod
+    _enable(["@a"], dbpath)
+    bot = FakeBot({"@a": "left"})
+    msg = FakeMsg()
+    msg.text = "123456789"
+    upd = SimpleNamespace(message=msg,
+                          effective_user=SimpleNamespace(id=111))
+    calls = []
+
+    async def fake_handle_state(update, context, st):
+        calls.append(st)
+
+    monkeypatch.setattr(main_mod, "_handle_state", fake_handle_state)
+    run(main_mod.on_text(upd, _receipt_ctx(bot)))
+    assert calls == []
+    assert msg.replies and "🔒" in msg.replies[-1][0]

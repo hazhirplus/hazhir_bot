@@ -69,25 +69,52 @@ async def missing_lock_channels(bot, uid: int) -> list[str]:
     return missing
 
 
-def lock_join_rows(missing) -> InlineKeyboardMarkup:
-    """Join button per @username channel + the recheck button."""
+async def channel_join_url(bot, ch: str) -> str | None:
+    """Join URL for a locked channel, or None when the bot cannot make one.
+
+    @username channels link straight to t.me. A numeric id (-100...)
+    needs the bot to read the channel: a public channel's username,
+    else its invite link (the bot must be an admin to see it). When
+    neither is available, None — the lock message shows the id with
+    guidance instead of a dead end (N4b).
+    """
+    if ch.startswith("@"):
+        return f"https://t.me/{ch[1:]}"
+    try:
+        chat = await bot.get_chat(ch)
+    except Exception:
+        return None
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}"
+    return getattr(chat, "invite_link", None)
+
+
+async def lock_join_rows(bot, missing) -> InlineKeyboardMarkup:
+    """Join button per channel that has a URL + the recheck button."""
     rows = []
     for ch in missing:
-        if ch.startswith("@"):
+        url = await channel_join_url(bot, ch)
+        if url:
             rows.append([InlineKeyboardButton(
-                f"📣 عضویت در {ch}", url=f"https://t.me/{ch[1:]}")])
+                f"📣 عضویت در {ch}", url=url)])
     rows.append([InlineKeyboardButton("✅ عضو شدم — بررسی عضویت",
                                       callback_data="u:chklock")])
     return InlineKeyboardMarkup(rows)
 
 
-async def show_channel_lock(msg, missing) -> None:
+async def show_channel_lock(msg, missing, bot) -> None:
     """Lock message: missing channels + join buttons + recheck."""
     lines = ["🔒 برای استفاده از ربات، اول در این کانال‌ها عضو شو:\n"]
     for ch in missing:
         lines.append(f"• {ch}")
+    kb = await lock_join_rows(bot, missing)
+    got_button = {b.text.removeprefix("📣 عضویت در ")
+                  for row in kb.inline_keyboard for b in row if b.url}
+    if any(ch not in got_button for ch in missing):
+        lines.append("\n⚠️ کانالی که دکمه ندارد را با همین آیدی در تلگرام "
+                     "جستجو کن یا از ادمین لینک دعوت بگیر.")
     lines.append("\nبعد از عضویت، «✅ عضو شدم — بررسی عضویت» رو بزن.")
-    await msg.reply_text("\n".join(lines), reply_markup=lock_join_rows(missing))
+    await msg.reply_text("\n".join(lines), reply_markup=kb)
 
 
 async def enforce_channel_lock(msg, context, uid: int) -> bool:
@@ -102,5 +129,5 @@ async def enforce_channel_lock(msg, context, uid: int) -> bool:
     missing = await missing_lock_channels(context.bot, uid)
     if not missing:
         return False
-    await show_channel_lock(msg, missing)
+    await show_channel_lock(msg, missing, context.bot)
     return True

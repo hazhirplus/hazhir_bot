@@ -1,9 +1,9 @@
 """Nightly DB backup for the VPN bot (user request 2026-11-12):
 
-Every night at 00:00 Tehran the bot sends the database file to the admins
-inside the bot itself, so a dead server or a server move doesn't mean
-re-entering everything from zero. A manual backup button + an auto-backup
-toggle live in the admin settings menu.
+Every night at 00:00 Tehran the bot sends the database file to the
+primary admin inside the bot itself, so a dead server or a server move
+doesn't mean re-entering everything from zero. A manual backup button
++ an auto-backup toggle live in the admin settings menu.
 
 Expected behaviour after the fix:
 - Scheduling: job_queue.run_daily at 00:00 Asia/Tehran (no manual UTC math).
@@ -241,6 +241,21 @@ async def test_send_backup_to_admins(dbpath, tmp_path):
     assert b.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 3
     assert b.execute("SELECT COUNT(*) FROM invoices").fetchone()[0] == 2
     b.close()
+
+
+async def test_send_backup_only_to_primary_admin(dbpath, tmp_path,
+                                                 monkeypatch):
+    """N3: with several admins, the full DB file goes only to the first
+    ADMIN_IDS (the owner) — never to every admin's chat history."""
+    monkeypatch.setattr(config, "ADMIN_IDS", [111, 222, 333])
+    await _seed(dbpath)
+    bot = FakeBot()
+    n = await backup.send_backup_to_admins(
+        bot, db_path=dbpath, dest_dir=str(tmp_path / "backups"))
+    assert n == 1
+    assert len(bot.docs) == 1
+    assert bot.docs[0][0] == 111
+    assert all(d[0] != 222 and d[0] != 333 for d in bot.docs)
 
 
 async def test_send_backup_no_admins(dbpath, tmp_path, monkeypatch):

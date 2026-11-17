@@ -28,6 +28,20 @@ from panel import PanelError, gb_to_bytes, days_to_ms, extract_sub_id
 
 log = logging.getLogger("hozhir")
 
+# Per-panel approval locks (N1): the sales-cap check and the client
+# creation in approve_invoice must not interleave between two concurrent
+# approvals on the same panel, or both pass the check on the last slot
+# and the cap is exceeded. One lock per panel id; approvals on
+# different panels still run in parallel.
+_approve_locks: dict[int, asyncio.Lock] = {}
+
+
+def _approve_lock(panel_id: int) -> asyncio.Lock:
+    lock = _approve_locks.get(panel_id)
+    if lock is None:
+        lock = _approve_locks[panel_id] = asyncio.Lock()
+    return lock
+
 SETTING_LABELS = {
     "welcome_text": "👋 متن خوش‌آمد",
     "support_text": "💬 متن پشتیبانی",
@@ -227,6 +241,16 @@ async def approve_invoice(context: ContextTypes.DEFAULT_TYPE, inv: dict,
         else await db.get_active_panel()
     if not panel:
         return "⚠️ پنل فعالی ثبت نشده."
+    # One approval per panel at a time: the cap check and the client
+    # creation below must not interleave with another approval on the
+    # same panel (N1). Top-ups never reach here (no panel client).
+    async with _approve_lock(panel["id"]):
+        return await _approve_on_panel(context, inv, admin_id, panel)
+
+
+async def _approve_on_panel(context: ContextTypes.DEFAULT_TYPE, inv: dict,
+                            admin_id: int, panel: dict) -> str:
+    """approve_invoice after the panel is resolved, serialized per panel."""
     if inv.get("kind") == "purchase" and not await db.panel_has_capacity(panel):
         # the cap filled up between payment and approval: refuse to build
         # a new client here; the invoice stays pending so the admin can
@@ -1034,22 +1058,26 @@ async def _setup_answer(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
         carried["name"] = txt[:60]
     elif step == "url":
-        if not txt or not txt.startswith(("http://", "https://")):
+        url = _https_url(txt)
+        if url is None:
             await msg.reply_text(
-                "❌ آدرس معتبر نیست — باید با http:// یا https:// شروع بشه. "
-                "دوباره بفرست:")
+                "❌ آدرس معتبر نیست — باید با https:// شروع بشه "
+                "(http:// قبول نیست، توکن پنل لو می‌ره). دوباره بفرست:")
             return
-        carried["url"] = txt.rstrip("/")
+        carried["url"] = url
     elif step == "token":
         if not txt:
             await msg.reply_text("❌ توکن خالیه — توکن API پنل رو بفرست:")
             return
         carried["token"] = txt
     elif step == "sub":
-        if not txt:
-            await msg.reply_text("❌ بیس ساب خالیه — لینک ساب رو بفرست:")
+        sub = _https_url(txt)
+        if sub is None:
+            await msg.reply_text(
+                "❌ بیس ساب معتبر نیست — باید با https:// شروع بشه. "
+                "دوباره بفرست:")
             return
-        carried["sub"] = txt.rstrip("/")
+        carried["sub"] = sub
     elif step == "inb":
         inb = [int(x) for x in txt.split(",") if x.strip().isdigit()]
         if not inb:
@@ -1160,6 +1188,16 @@ def _snum(txt: str) -> int | None:
     return -n if t.startswith("-") else n
 
 
+def _https_url(txt: str) -> str | None:
+    """Valid https:// URL, or None. Panel URLs and sub bases carry the
+    API token and the service links — plain http:// would leak them on
+    the wire (N5). Returns the URL without a trailing slash."""
+    t = (txt or "").strip()
+    if not t.startswith("https://") or len(t) <= len("https://"):
+        return None
+    return t.rstrip("/")
+
+
 async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                              st: dict) -> bool:
     """Returns True if the state was an admin state (handled or not)."""
@@ -1176,17 +1214,29 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
             context.user_data["st"] = {"k": "a_padd_url", "name": txt}
             await msg.reply_text("🔗 آدرس پنل (مثل https://host:port/base):")
         elif k == "a_padd_url":
+            url = _https_url(txt)
+            if url is None:
+                await msg.reply_text(
+                    "❌ آدرس معتبر نیست — باید با https:// شروع بشه "
+                    "(http:// قبول نیست). دوباره بفرست:")
+                return True
             context.user_data["st"] = {"k": "a_padd_token", "name": st["name"],
-                                       "url": txt.rstrip("/")}
+                                       "url": url}
             await msg.reply_text("🔑 توکن API پنل (دسترسی admin):")
         elif k == "a_padd_token":
             context.user_data["st"] = {"k": "a_padd_sub", "name": st["name"],
                                        "url": st["url"], "token": txt}
             await msg.reply_text("📡 بیس لینک ساب (مثل https://host:2096/xxxx):")
         elif k == "a_padd_sub":
+            sub = _https_url(txt)
+            if sub is None:
+                await msg.reply_text(
+                    "❌ بیس ساب معتبر نیست — باید با https:// شروع بشه. "
+                    "دوباره بفرست:")
+                return True
             context.user_data["st"] = {"k": "a_padd_inb", "name": st["name"],
                                        "url": st["url"], "token": st["token"],
-                                       "sub": txt.rstrip("/")}
+                                       "sub": sub}
             await msg.reply_text("🔌 آیدی اینباندها با کاما (مثل 1,9,11):")
         elif k == "a_padd_inb":
             inb = [int(x) for x in txt.split(",") if x.strip().isdigit()]
@@ -1199,11 +1249,23 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
             context.user_data.pop("st", None)
             await msg.reply_text("✅ توکن به‌روز شد.")
         elif k == "a_purl":
-            await db.update_panel(st["pid"], url=txt.rstrip("/"))
+            url = _https_url(txt)
+            if url is None:
+                await msg.reply_text(
+                    "❌ آدرس معتبر نیست — باید با https:// شروع بشه "
+                    "(http:// قبول نیست). دوباره بفرست:")
+                return True
+            await db.update_panel(st["pid"], url=url)
             context.user_data.pop("st", None)
             await msg.reply_text("✅ آدرس به‌روز شد.")
         elif k == "a_psub":
-            await db.update_panel(st["pid"], sub_base=txt.rstrip("/"))
+            sub = _https_url(txt)
+            if sub is None:
+                await msg.reply_text(
+                    "❌ بیس ساب معتبر نیست — باید با https:// شروع بشه. "
+                    "دوباره بفرست:")
+                return True
+            await db.update_panel(st["pid"], sub_base=sub)
             context.user_data.pop("st", None)
             await msg.reply_text("✅ بیس ساب به‌روز شد.")
         elif k == "a_pname":
@@ -1347,9 +1409,15 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         return True
                     txt = str(n)
             if key == "sub_base":
+                sub = _https_url(txt)
+                if sub is None:
+                    await msg.reply_text(
+                        "❌ بیس ساب معتبر نیست — باید با https:// شروع بشه. "
+                        "دوباره بفرست:")
+                    return True
                 p = await db.get_active_panel()
                 if p:
-                    await db.update_panel(p["id"], sub_base=txt.rstrip("/"))
+                    await db.update_panel(p["id"], sub_base=sub)
             else:
                 await db.set_setting(key, txt)
             context.user_data.pop("st", None)
