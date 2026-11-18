@@ -189,11 +189,214 @@ async def plan_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not plan or not plan["active"]:
         await q.edit_message_text(T.NO_PLANS)
         return
+    st = context.user_data.get("st") or {}
+    discount = _st_discount(st, pid) if st.get("k") == "discount_applied" else None
+    if st.get("k") == "discount_applied" and not discount:
+        context.user_data.pop("st", None)  # stale discount for another plan
+    await _render_plan_detail(q, plan, discount)
+
+
+async def _render_plan_detail(q, plan: dict, discount: dict | None = None) -> None:
+    """Plan screen, with the discounted price when a code was applied
+    (crypto is hidden then — its amount is quoted from the full price)."""
     bal = await db.get_balance(q.from_user.id)
     crypto_ok = await _crypto_available()
+    price = discount["final_price"] if discount else plan["price_toman"]
+    txt = T.plan_line(plan)
+    if discount:
+        txt += ("\n\n" + T.DISC_APPLIED_LINE.format(
+                    code=discount["code"], desc=_discount_desc(discount))
+                + f"\n{T.DISC_BEFORE_LINE.format(price=T.fmt_price(plan['price_toman']))}"
+                + f"\n💰 مبلغ با تخفیف: {T.fmt_price(price)}")
     await q.edit_message_text(
-        T.plan_line(plan),
-        reply_markup=K.buy_kb(pid, bal >= plan["price_toman"], bal, crypto_ok))
+        txt, reply_markup=K.buy_kb(plan["id"], bal >= price, bal, crypto_ok,
+                                   discount_applied=bool(discount)))
+
+
+# ---------------- discount codes (user side) ----------------
+def _discount_desc(d: dict) -> str:
+    if d["kind"] == "percent":
+        return f"{d['value']}٪ تخفیف"
+    return f"{d['value']:,} تومان تخفیف"
+
+
+def _discount_error_text(err: str, row=None, kind: str = "buy") -> str:
+    if err == "scope_kind":
+        return (T.DISC_SCOPE_KIND_RENEW if kind == "buy"
+                else T.DISC_SCOPE_KIND_BUY)
+    return {
+        "not_found": T.DISC_INVALID,
+        "inactive": T.DISC_INACTIVE,
+        "expired": T.DISC_EXPIRED,
+        "limit_total": T.DISC_LIMIT_TOTAL,
+        "limit_per_user": T.DISC_LIMIT_USER.format(
+            n=row["limit_per_user"] if row else 1),
+        "first_only": T.DISC_FIRST_ONLY,
+        "scope_plan": T.DISC_SCOPE_PLAN,
+        "scope_panel": T.DISC_SCOPE_PANEL,
+    }.get(err, T.DISC_INVALID)
+
+
+def _st_discount(st: dict, plan_id: int | None = None):
+    """The discount stored in state, only when it belongs to this plan
+    (a stale discount from another plan is ignored, never applied)."""
+    d = (st or {}).get("discount")
+    if not d:
+        return None
+    if plan_id is not None and d.get("plan_id") != plan_id:
+        return None
+    return d
+
+
+async def discount_buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """u:discount:<pid> — ask for the discount code for this plan."""
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[2])
+    plan = await db.get_plan(pid)
+    if not plan or not plan["active"]:
+        await q.edit_message_text(T.NO_PLANS)
+        return
+    panel = await _chosen_panel(context)
+    if not panel:
+        await q.edit_message_text(T.NO_PANEL)
+        return
+    context.user_data["st"] = {"k": "discount_buy", "plan_id": pid,
+                               "panel_id": panel["id"]}
+    await q.message.reply_text(T.DISC_ASK)
+
+
+async def discount_renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """u:renewdiscount — ask for the discount code for this renew."""
+    q = update.callback_query
+    await q.answer()
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "renew_pay":
+        await q.answer("منقضی شد.", show_alert=True)
+        return
+    plan = await db.get_plan(st.get("plan_id"))
+    target = await db.get_invoice(st.get("target_inv"))
+    if not plan or not target:
+        await q.edit_message_text(T.NO_PLANS)
+        return
+    context.user_data["st"] = {"k": "discount_renew", "plan_id": plan["id"],
+                               "target_inv": target["id"],
+                               "panel_id": target.get("panel_id")}
+    await q.message.reply_text(T.DISC_ASK)
+
+
+async def _handle_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                st: dict) -> None:
+    """Text input while waiting for a discount code (buy or renew)."""
+    msg = update.message
+    code = db.normalize_discount_code(msg.text or "")
+    flow = "renew" if st.get("k") == "discount_renew" else "buy"
+    plan = await db.get_plan(st.get("plan_id"))
+    if not plan:
+        context.user_data.pop("st", None)
+        await msg.reply_text(T.NO_PLANS)
+        return
+    ok, row, err, final = await db.validate_discount(
+        code, msg.from_user.id, plan_id=plan["id"],
+        panel_id=st.get("panel_id"), kind=flow, price=plan["price_toman"])
+    if not ok:
+        # state stays: the user can send another code (the payment
+        # buttons on the earlier plan message still work, too)
+        await msg.reply_text(_discount_error_text(err, row, flow))
+        return
+    discount = {"code": row["code"], "code_id": row["id"], "kind": row["kind"],
+                "value": row["value"], "final_price": final,
+                "plan_id": plan["id"], "panel_id": st.get("panel_id")}
+    if flow == "buy":
+        context.user_data["st"] = {"k": "discount_applied",
+                                   "plan_id": plan["id"],
+                                   "panel_id": st.get("panel_id"),
+                                   "discount": discount}
+        bal = await db.get_balance(msg.from_user.id)
+        crypto_ok = await _crypto_available()
+        txt = (f"{T.plan_line(plan)}\n\n"
+               + T.DISC_APPLIED_LINE.format(code=discount["code"],
+                                            desc=_discount_desc(discount))
+               + f"\n{T.DISC_BEFORE_LINE.format(price=T.fmt_price(plan['price_toman']))}"
+               + f"\n💰 مبلغ با تخفیف: {T.fmt_price(final)}")
+        await msg.reply_text(
+            txt, reply_markup=K.buy_kb(plan["id"], bal >= final, bal,
+                                       crypto_ok, discount_applied=True))
+    else:
+        target = await db.get_invoice(st.get("target_inv"))
+        if not target:
+            context.user_data.pop("st", None)
+            await msg.reply_text(T.NO_PLANS)
+            return
+        context.user_data["st"] = {"k": "renew_pay",
+                                   "target_inv": target["id"],
+                                   "plan_id": plan["id"], "discount": discount}
+        bal = await db.get_balance(msg.from_user.id)
+        crypto_ok = await _crypto_available()
+        await msg.reply_text(
+            _renew_pay_text(plan, discount),
+            reply_markup=_renew_pay_kb(plan, target, bal, crypto_ok, discount))
+
+
+def _renew_pay_text(plan: dict, discount: dict | None = None) -> str:
+    price = discount["final_price"] if discount else plan["price_toman"]
+    txt = f"{T.plan_line(plan)}\n\n💰 مبلغ تمدید: {T.fmt_price(price)}"
+    if discount:
+        txt = (f"{T.plan_line(plan)}\n\n"
+               + T.DISC_APPLIED_LINE.format(code=discount["code"],
+                                            desc=_discount_desc(discount))
+               + f"\n{T.DISC_BEFORE_LINE.format(price=T.fmt_price(plan['price_toman']))}"
+               + f"\n💰 مبلغ تمدید با تخفیف: {T.fmt_price(price)}")
+    return txt
+
+
+def _renew_pay_kb(plan: dict, target: dict, bal: int, crypto_ok: bool,
+                  discount: dict | None = None) -> InlineKeyboardMarkup:
+    price = discount["final_price"] if discount else plan["price_toman"]
+    rows = []
+    if bal >= price:
+        rows.append([InlineKeyboardButton(
+            f"👜 پرداخت با کیف پول ({bal:,} تومان)", callback_data="u:renewwallet")])
+    if crypto_ok and not discount:
+        rows.append([InlineKeyboardButton("💎 ارز دیجیتال",
+                                          callback_data="u:renewcrypto")])
+    rows.append([InlineKeyboardButton("💳 کارت‌به‌کارت",
+                                      callback_data="u:renewcard")])
+    if not discount:
+        rows.append([InlineKeyboardButton("🎁 کد تخفیف",
+                                          callback_data="u:renewdiscount")])
+    rows.append([InlineKeyboardButton("◀️ برگشت",
+                                      callback_data=f"u:renew:{target['id']}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def gift_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """u:giftcode — ask for a gift code (wallet credit) in the wallet menu."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data["st"] = {"k": "gift_code"}
+    await q.message.reply_text(T.GIFT_ASK)
+
+
+async def _handle_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Text input while waiting for a gift code: redeem or explain why not."""
+    msg = update.message
+    ok, amount, err = await db.redeem_gift_code(msg.text or "",
+                                                msg.from_user.id)
+    if not ok:
+        # state stays: the user can send another code
+        await msg.reply_text({
+            "not_found": T.GIFT_INVALID,
+            "inactive": T.GIFT_INACTIVE,
+            "limit_total": T.GIFT_LIMIT,
+            "already_used": T.GIFT_USED,
+        }.get(err, T.GIFT_INVALID))
+        return
+    bal = await db.get_balance(msg.from_user.id)
+    context.user_data.pop("st", None)
+    await msg.reply_text(
+        T.GIFT_OK.format(amount=T.fmt_price(amount), bal=T.fmt_price(bal)),
+        reply_markup=_mm(update))
 
 
 async def _card_block() -> str | None:
@@ -216,16 +419,37 @@ async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not panel:
         await q.edit_message_text(T.NO_PANEL)
         return
+    # discount: re-validate at the card screen (time passed since entry);
+    # a dead code is dropped silently and the full price is shown
+    st = context.user_data.get("st") or {}
+    discount = _st_discount(st, pid) if st.get("k") == "discount_applied" else None
+    price = plan["price_toman"]
+    if discount:
+        ok, row, err, final = await db.validate_discount(
+            discount["code"], q.from_user.id, plan_id=pid,
+            panel_id=panel["id"], kind="buy", price=price)
+        if ok:
+            price = final
+        else:
+            discount = None
+            context.user_data.pop("st", None)
     guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
     head = f"{guide}\n\n" if guide else ""
+    disc_line = ""
+    if discount:
+        disc_line = ("\n" + T.DISC_APPLIED_LINE.format(
+            code=discount["code"], desc=_discount_desc(discount)) + "\n")
     # State only after the screen was delivered: if the edit fails the
     # user is not left waiting for a receipt they never saw the card for.
     await send_md(
         q.edit_message_text,
-        f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
-        f"💰 مبلغ: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}")
-    context.user_data["st"] = {"k": "receipt", "plan_id": pid, "kind": "purchase",
-                               "panel_id": panel["id"]}
+        f"{head}{T.plan_line(plan)}\n\n{card_block}\n{disc_line}"
+        f"💰 مبلغ: {T.fmt_price(price)}\n\n{T.RECEIPT_ASK}")
+    st = {"k": "receipt", "plan_id": pid, "kind": "purchase",
+          "panel_id": panel["id"]}
+    if discount:
+        st["discount"] = discount
+    context.user_data["st"] = st
 
 
 async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
@@ -234,21 +458,39 @@ async def _start_renew_payment(q, context, inv: dict, plan: dict) -> None:
     if not card_block:
         await q.edit_message_text(T.NO_CARD)
         return
+    st = context.user_data.get("st") or {}
+    discount = _st_discount(st, plan["id"]) if st.get("k") == "renew_pay" else None
+    price = plan["price_toman"]
+    if discount:
+        ok, row, err, final = await db.validate_discount(
+            discount["code"], q.from_user.id, plan_id=plan["id"],
+            panel_id=inv.get("panel_id"), kind="renew", price=price)
+        if ok:
+            price = final
+        else:
+            discount = None
     guide = (await db.get_setting("buy_guide", T.BUY_GUIDE_DEFAULT)).strip()
     head = f"{guide}\n\n" if guide else ""
+    disc_line = ""
+    if discount:
+        disc_line = ("\n" + T.DISC_APPLIED_LINE.format(
+            code=discount["code"], desc=_discount_desc(discount)) + "\n")
     # State only after the screen was delivered: if the edit fails the
     # user is not left waiting for a receipt they never saw the card for.
     await send_md(
         q.edit_message_text,
-        f"{head}{T.plan_line(plan)}\n\n{card_block}\n\n"
-        f"💰 مبلغ تمدید: {T.fmt_price(plan['price_toman'])}\n\n{T.RECEIPT_ASK}")
-    context.user_data["st"] = {
+        f"{head}{T.plan_line(plan)}\n\n{card_block}\n{disc_line}"
+        f"💰 مبلغ تمدید: {T.fmt_price(price)}\n\n{T.RECEIPT_ASK}")
+    st = {
         "k": "receipt", "plan_id": plan["id"], "kind": "renew",
         "panel_id": inv.get("panel_id"),
         "panel_email": inv.get("panel_email", ""),
         "sub_id": inv.get("sub_id", ""),
         "base_expires": inv.get("expires_at", 0),
     }
+    if discount:
+        st["discount"] = discount
+    context.user_data["st"] = st
 
 
 async def renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -279,18 +521,10 @@ async def renew_plan_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     context.user_data["st"] = {"k": "renew_pay", "target_inv": target["id"], "plan_id": pid}
     bal = await db.get_balance(q.from_user.id)
-    rows = []
-    if bal >= plan["price_toman"]:
-        rows.append([InlineKeyboardButton(
-            f"👜 پرداخت با کیف پول ({bal:,} تومان)", callback_data="u:renewwallet")])
-    if await _crypto_available():
-        rows.append([InlineKeyboardButton("💎 ارز دیجیتال", callback_data="u:renewcrypto")])
-    rows.append([InlineKeyboardButton("💳 کارت‌به‌کارت", callback_data="u:renewcard")])
-    rows.append([InlineKeyboardButton("◀️ برگشت", callback_data=f"u:renew:{target['id']}")])
+    crypto_ok = await _crypto_available()
     await q.edit_message_text(
-        f"{T.plan_line(plan)}\n\n💰 مبلغ تمدید: {T.fmt_price(plan['price_toman'])}\n\n"
-        "روش پرداخت رو انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(rows))
+        _renew_pay_text(plan),
+        reply_markup=_renew_pay_kb(plan, target, bal, crypto_ok))
 
 
 async def renew_pay_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,19 +556,51 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.edit_message_text(T.NO_PLANS)
         return
     uid = q.from_user.id
+    # discount: re-validate (time passed since entry); a dead code drops
+    # the user back to the pay screen at full price
+    discount = _st_discount(st, plan["id"])
+    price = plan["price_toman"]
+    if discount:
+        ok, row, err, final = await db.validate_discount(
+            discount["code"], uid, plan_id=plan["id"],
+            panel_id=target.get("panel_id"), kind="renew", price=price)
+        if not ok:
+            context.user_data["st"] = {"k": "renew_pay",
+                                       "target_inv": target["id"],
+                                       "plan_id": plan["id"]}
+            await q.answer(_discount_error_text(err, row, "renew"),
+                           show_alert=True)
+            bal = await db.get_balance(uid)
+            await q.edit_message_text(
+                _renew_pay_text(plan),
+                reply_markup=_renew_pay_kb(plan, target, bal,
+                                           await _crypto_available()))
+            return
+        price = final
     # Atomic conditional debit: the funds check and the debit are one SQL
     # statement, so two rapid taps cannot both pass (vibe-check 32).
-    if not await db.debit_balance(uid, plan["price_toman"]):
+    if not await db.debit_balance(uid, price):
         await q.answer("موجودی کیف پول کافی نیست.", show_alert=True)
         return
     from handlers_admin import approve_invoice
     iid = await db.create_invoice(
         user_id=uid, kind="renew", plan_id=plan["id"],
-        price_toman=plan["price_toman"],
+        price_toman=price,
         panel_id=target.get("panel_id"),
         panel_email=target.get("panel_email", ""),
         sub_id=target.get("sub_id", ""),
-        expires_at=target.get("expires_at", 0))
+        expires_at=target.get("expires_at", 0),
+        discount_code=discount["code"] if discount else "",
+        price_before=plan["price_toman"] if discount else 0)
+    if discount and not await db.consume_discount_code(
+            discount["code_id"], uid, iid):
+        # the last use was taken between validation and now: refund in
+        # full and close the invoice (same N6 pattern as a failed approval)
+        await db.add_balance(uid, price)
+        await db.update_invoice(iid, status="rejected")
+        await db.set_payment(iid, "rejected", None)
+        await q.edit_message_text(T.DISC_GONE)
+        return
     context.user_data.pop("st", None)
     try:
         res = await approve_invoice(context, await db.get_invoice(iid), None)
@@ -349,9 +615,11 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # pending would keep it in the admin queue, where approving it
     # later would hand out a free service for money already refunded.
     if inv["status"] != "active":
-        await db.add_balance(uid, plan["price_toman"])
+        await db.add_balance(uid, price)
         await db.update_invoice(iid, status="rejected")
         await db.set_payment(iid, "rejected", None)
+        if discount:
+            await db.release_discount_for_invoice(iid)
         await q.edit_message_text(
             f"⚠️ {res}\nمبلغ به کیف پولت برگشت. فاکتور بسته شد.")
         return
@@ -371,16 +639,42 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not panel:
         await q.edit_message_text(T.NO_PANEL)
         return
+    st = context.user_data.get("st") or {}
+    discount = _st_discount(st, plan["id"]) if st.get("k") == "discount_applied" else None
+    price = plan["price_toman"]
+    if discount:
+        ok, row, err, final = await db.validate_discount(
+            discount["code"], uid, plan_id=plan["id"],
+            panel_id=panel["id"], kind="buy", price=price)
+        if not ok:
+            context.user_data.pop("st", None)
+            await q.answer(_discount_error_text(err, row, "buy"),
+                           show_alert=True)
+            await _render_plan_detail(q, plan, None)
+            return
+        price = final
     # Atomic conditional debit (see renew_pay_wallet): check + debit in one
     # statement so a double-tap cannot spend the same balance twice.
-    if not await db.debit_balance(uid, plan["price_toman"]):
+    if not await db.debit_balance(uid, price):
         await q.answer("موجودی کیف پول کافی نیست.", show_alert=True)
         return
     from handlers_admin import approve_invoice
     iid = await db.create_invoice(user_id=uid, kind="purchase",
                                   plan_id=plan["id"],
-                                  price_toman=plan["price_toman"],
-                                  panel_id=panel["id"])
+                                  price_toman=price,
+                                  panel_id=panel["id"],
+                                  discount_code=discount["code"] if discount else "",
+                                  price_before=plan["price_toman"] if discount else 0)
+    if discount and not await db.consume_discount_code(
+            discount["code_id"], uid, iid):
+        # the last use was taken between validation and now: refund in
+        # full and close the invoice (same N6 pattern as a failed approval)
+        await db.add_balance(uid, price)
+        await db.update_invoice(iid, status="rejected")
+        await db.set_payment(iid, "rejected", None)
+        await q.edit_message_text(T.DISC_GONE)
+        return
+    context.user_data.pop("st", None)  # the discount is spent; don't reuse it
     try:
         res = await approve_invoice(context, await db.get_invoice(iid), None)
     except Exception as e:
@@ -394,9 +688,11 @@ async def wallet_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # pending would keep it in the admin queue, where approving it
     # later would hand out a free service for money already refunded.
     if inv["status"] != "active":
-        await db.add_balance(uid, plan["price_toman"])
+        await db.add_balance(uid, price)
         await db.update_invoice(iid, status="rejected")
         await db.set_payment(iid, "rejected", None)
+        if discount:
+            await db.release_discount_for_invoice(iid)
         await q.edit_message_text(
             f"⚠️ {res}\nمبلغ به کیف پولت برگشت. فاکتور بسته شد.")
         return
@@ -633,8 +929,9 @@ async def crypto_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------- wallet menu ----------------
 async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bal = await db.get_balance(update.effective_user.id)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("➕ شارژ کیف پول", callback_data="u:wallettop")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ شارژ کیف پول", callback_data="u:wallettop")],
+        [InlineKeyboardButton("🎁 کد هدیه", callback_data="u:giftcode")]])
     await update.message.reply_text(
         f"👜 کیف پول\n\n💰 موجودی: {T.fmt_price(bal)}", reply_markup=kb)
 
@@ -713,10 +1010,42 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, st
                                                 uid=first["user_id"])
     price = plan["price_toman"] if plan else st.get("amount", 0)
     plan_name = plan["name"] if plan else "شارژ کیف پول"
+    # discount: re-validate at the receipt (time passed since the code
+    # was entered); a dead code means the receipt is NOT recorded — the
+    # user re-sends it at full price instead of paying for a discount
+    # that no longer exists
+    discount = st.get("discount")
+    disc_note = ""
+    if discount and st.get("kind") in ("purchase", "renew"):
+        flow = "buy" if st["kind"] == "purchase" else "renew"
+        ok, row, err, final = await db.validate_discount(
+            discount["code"], msg.from_user.id,
+            plan_id=plan["id"] if plan else None,
+            panel_id=st.get("panel_id"), kind=flow, price=price)
+        if not ok:
+            st.pop("discount", None)
+            context.user_data["st"] = st
+            await msg.reply_text(_discount_error_text(err, row, flow)
+                                 + "\nرسید ثبت نشد — بدون کد، رسید رو دوباره بفرست.")
+            return
+        disc_note = ("\n" + T.DISC_APPLIED_LINE.format(
+            code=discount["code"], desc=_discount_desc(discount))
+            + f" — {T.DISC_BEFORE_LINE.format(price=T.fmt_price(price))}")
+        price = final
     iid = await db.create_invoice(
         user_id=msg.from_user.id, kind=st["kind"],
         plan_id=plan["id"] if plan else None,
-        price_toman=price, receipt_file_id=file_id)
+        price_toman=price, receipt_file_id=file_id,
+        discount_code=discount["code"] if discount else "",
+        price_before=plan["price_toman"] if discount else 0)
+    if discount and not await db.consume_discount_code(
+            discount["code_id"], msg.from_user.id, iid):
+        # the last use was taken between validation and now
+        await db.update_invoice(iid, status="rejected")
+        await db.set_payment(iid, "rejected", None)
+        await msg.reply_text(T.DISC_GONE)
+        return
+    # prefill panel identity for renewals
     # prefill panel identity for renewals
     if st["kind"] == "renew":
         await db.update_invoice(iid, panel_id=st.get("panel_id"),
@@ -736,7 +1065,7 @@ async def _handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, st
         T.ADMIN_NEW_PAYMENT.format(user=f"{uname} ({u.id})", plan=plan_name,
                                    kind=T.KIND_FA.get(st["kind"], st["kind"]),
                                    price=T.fmt_price(price),
-                                   receipt=receipt_note) + dup_warn,
+                                   receipt=receipt_note) + disc_note + dup_warn,
         reply_markup=K.pay_decision_kb(iid, manual=(st["kind"] != "topup")))
     if file_id and not file_id.startswith("text:"):
         for aid in config.ADMIN_IDS:
@@ -967,6 +1296,14 @@ async def _handle_state(update: Update, context: ContextTypes.DEFAULT_TYPE, st: 
     k = st.get("k")
     if k == "receipt":
         await _handle_receipt(update, context, st)
+    elif k in ("discount_buy", "discount_renew"):
+        await _handle_discount_code(update, context, st)
+    elif k == "gift_code":
+        await _handle_gift_code(update, context)
+    elif k == "discount_applied":
+        # the code is in; text is ignored (payment buttons decide)
+        await update.message.reply_text(
+            "🎁 کد تخفیف اعمال شده — روش پرداخت رو از پیام بالا انتخاب کن 👆")
     elif k == "support":
         await _handle_support(update, context)
     elif k == "wallet_amount":
@@ -1036,6 +1373,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await buy_start(update, context)
     elif data.startswith("u:walletbuy:"):
         await wallet_buy(update, context)
+    elif data.startswith("u:discount:"):
+        await discount_buy_start(update, context)
+    elif data == "u:renewdiscount":
+        await discount_renew_start(update, context)
+    elif data == "u:giftcode":
+        await gift_code_start(update, context)
     elif data.startswith("u:cryptobuy:"):
         await crypto_buy_start(update, context)
     elif data == "u:renewcrypto":

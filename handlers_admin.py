@@ -143,6 +143,7 @@ ADMIN_SECTIONS = {
     "📚 آموزش‌ها": "tutorials_menu",
     "📢 پیام همگانی": "broadcast_home",
     "⚙️ تنظیمات": "settings_menu",
+    "🎁 کدهای تخفیف": "discounts_menu",
     "📖 آموزش راه‌اندازی": "setup_guide_home",
 }
 
@@ -204,6 +205,9 @@ async def pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         label = (f"🧾 فاکتور #{inv['id']} — {T.KIND_FA.get(inv['kind'], inv['kind'])}\n"
                  f"👤 {inv['user_id']} | 📦 {plan['name'] if plan else '—'} | "
                  f"💰 {T.fmt_price(inv['price_toman'])}")
+        if inv.get("discount_code"):
+            label += (f"\n🎁 کد: {inv['discount_code']} "
+                      f"(قبل از تخفیف: {T.fmt_price(inv.get('price_before') or inv['price_toman'])})")
         kb = K.pay_decision_kb(inv["id"], manual=(inv["kind"] != "topup"))
         if inv["receipt_file_id"] and not inv["receipt_file_id"].startswith("text:"):
             try:
@@ -340,6 +344,8 @@ async def on_pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await db.update_invoice(inv["id"], status="rejected")
         await db.set_payment(inv["id"], "rejected", q.from_user.id)
+        # the code the customer used is freed for reuse
+        await db.release_discount_for_invoice(inv["id"])
         try:
             await context.bot.send_message(inv["user_id"], T.PAYMENT_REJECTED)
         except Exception:
@@ -690,6 +696,8 @@ async def user_service_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif action == "del":
             await pc.delete_client(inv["panel_email"])
             await db.update_invoice(inv["id"], status="expired")
+            # the removed service frees the code it was bought with
+            await db.release_discount_for_invoice(inv["id"])
             await q.answer("از پنل حذف شد.")
     except PanelError as e:
         await q.answer(f"خطای پنل: {e}", show_alert=True)
@@ -1118,6 +1126,243 @@ async def _setup_skip(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await _setup_finish(update, context)
         return
     await _setup_advance(update, context, step, carried)
+
+
+# ---------------- discount codes ----------------
+# Two mechanisms (mirzabot): discount codes cut a purchase/renew price,
+# gift codes credit a fixed amount to the wallet. Who may create codes
+# is an in-bot setting (discount_create_by): "owner" (default) or
+# "admins"; only the owner can change it.
+async def _can_create_discount(uid: int) -> bool:
+    if not config.is_admin(uid):
+        return False
+    who = await db.get_setting("discount_create_by", "owner")
+    if who == "admins":
+        return True
+    return config.is_owner(uid)
+
+
+def _carry(st: dict, **extra) -> dict:
+    """State dict for the next wizard step: keep carried values, drop 'k'."""
+    d = {k: v for k, v in st.items() if k != "k"}
+    d.update(extra)
+    return d
+
+
+def _disc_desc(c: dict) -> str:
+    return f"{c['value']}٪" if c["kind"] == "percent" else f"{c['value']:,} تومان"
+
+
+async def _disc_text(c: dict) -> str:
+    scope_kind = {"buy": "خرید", "renew": "تمدید",
+                  "all": "خرید و تمدید"}.get(c["scope_kind"], c["scope_kind"])
+    panel_name = "همه سرورها"
+    if c.get("scope_panel") is not None:
+        p = await db.get_panel(c["scope_panel"])
+        panel_name = p["name"] if p else f"سرور #{c['scope_panel']} (حذف‌شده)"
+    plan_name = "همه پلن‌ها"
+    if c.get("scope_plan") is not None:
+        p = await db.get_plan(c["scope_plan"])
+        plan_name = p["name"] if p else f"پلن #{c['scope_plan']} (حذف‌شده)"
+    exp = "نامحدود"
+    if c.get("expires_at"):
+        left = c["expires_at"] - int(time.time())
+        exp = f"{max(0, left // 3600)} ساعت دیگر" if left > 0 else "منقضی شده"
+    return (
+        f"🎁 کد: {c['code']}\n"
+        f"{'🟢 فعال' if c['active'] else '⚪ غیرفعال'}\n"
+        f"💰 تخفیف: {_disc_desc(c)}\n"
+        f"📊 سقف کل: {'نامحدود' if not c['limit_total'] else f'{c['limit_total']:,}'}"
+        f" — مصرف‌شده: {c['used_total']:,}\n"
+        f"👤 سقف هر کاربر: {c['limit_per_user']}\n"
+        f"🆕 فقط خرید اول: {'بله' if c['first_only'] else 'خیر'}\n"
+        f"🛒 بخش: {scope_kind}\n"
+        f"🌐 سرور: {panel_name}\n"
+        f"📦 پلن: {plan_name}\n"
+        f"⏳ انقضا: {exp}")
+
+
+@admin_only
+async def discounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    who = await db.get_setting("discount_create_by", "owner")
+    who_label = "فقط مالک" if who == "owner" else "همه ادمین‌ها"
+    rows = []
+    if await _can_create_discount(update.effective_user.id):
+        rows.append([InlineKeyboardButton("➕ ساخت کد تخفیف",
+                                          callback_data="adm_disc_add")])
+        rows.append([InlineKeyboardButton("🎁 ساخت کد هدیه",
+                                          callback_data="adm_disc_gift_add")])
+    rows.append([InlineKeyboardButton("📋 لیست کدهای تخفیف",
+                                      callback_data="adm_disc_list")])
+    rows.append([InlineKeyboardButton("📋 لیست کدهای هدیه",
+                                      callback_data="adm_disc_gift_list")])
+    if config.is_owner(update.effective_user.id):
+        rows.append([InlineKeyboardButton(
+            f"👤 ساخت کد: {who_label} — تغییر وضعیت",
+            callback_data="adm_disc_who")])
+    await _show(update,
+                "🎁 کدهای تخفیف\n\n"
+                "کد تخفیف قیمت خرید/تمدید رو کم می‌کنه؛ کد هدیه مبلغ ثابتی "
+                "به کیف پول مشتری اضافه می‌کنه.\n"
+                f"👤 چه کسی کد بسازد: {who_label}",
+                _with_back(rows))
+
+
+@admin_only
+async def discounts_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    codes = await db.list_discount_codes()
+    rows = [[InlineKeyboardButton(
+        f"{'🟢' if c['active'] else '⚪'} {c['code']} — {_disc_desc(c)} "
+        f"({c['used_total']:,}/{c['limit_total'] or '∞'})",
+        callback_data=f"adm_disc_view:{c['id']}")] for c in codes]
+    if await _can_create_discount(update.effective_user.id):
+        rows.append([InlineKeyboardButton("➕ ساخت کد جدید",
+                                          callback_data="adm_disc_add")])
+    rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_disc_home")])
+    await _show(update,
+                "🎁 کدهای تخفیف:" if codes else "هنوز کد تخفیفی ساخته نشده.",
+                _with_back(rows))
+
+
+async def discount_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          cid: int) -> None:
+    q = update.callback_query
+    c = await db.get_discount_code_by_id(cid)
+    if not c:
+        await q.answer("یافت نشد.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 فعال/غیرفعال",
+                              callback_data=f"adm_disc_toggle:{cid}"),
+         InlineKeyboardButton("🗑 حذف", callback_data=f"adm_disc_del:{cid}")],
+        [InlineKeyboardButton("◀️ برگشت", callback_data="adm_disc_list")],
+    ])
+    await q.edit_message_text(await _disc_text(c), reply_markup=kb)
+
+
+@admin_only
+async def gift_codes_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    codes = await db.list_gift_codes()
+    rows = [[InlineKeyboardButton(
+        f"{'🟢' if c['active'] else '⚪'} {c['code']} — {c['amount']:,} تومان "
+        f"({c['used_total']:,}/{c['limit_total'] or '∞'})",
+        callback_data=f"adm_gift_view:{c['id']}")] for c in codes]
+    if await _can_create_discount(update.effective_user.id):
+        rows.append([InlineKeyboardButton("➕ ساخت کد هدیه",
+                                          callback_data="adm_disc_gift_add")])
+    rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_disc_home")])
+    await _show(update,
+                "🎁 کدهای هدیه:" if codes else "هنوز کد هدیه‌ای ساخته نشده.",
+                _with_back(rows))
+
+
+async def gift_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      cid: int) -> None:
+    q = update.callback_query
+    c = await db.get_gift_code_by_id(cid)
+    if not c:
+        await q.answer("یافت نشد.", show_alert=True)
+        return
+    txt = (f"🎁 کد هدیه: {c['code']}\n"
+           f"{'🟢 فعال' if c['active'] else '⚪ غیرفعال'}\n"
+           f"💰 مبلغ: {c['amount']:,} تومان\n"
+           f"📊 مصرف: {c['used_total']:,} / "
+           f"{'نامحدود' if not c['limit_total'] else f'{c['limit_total']:,}'}")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 فعال/غیرفعال",
+                              callback_data=f"adm_gift_toggle:{cid}"),
+         InlineKeyboardButton("🗑 حذف", callback_data=f"adm_gift_del:{cid}")],
+        [InlineKeyboardButton("◀️ برگشت", callback_data="adm_disc_gift_list")],
+    ])
+    await q.edit_message_text(txt, reply_markup=kb)
+
+
+# ---- discount creation wizard (button-driven steps) ----
+async def _disc_wizard_kind(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            kind: str) -> None:
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "a_disc_kind" or kind not in ("percent", "fixed"):
+        await update.callback_query.answer("منقضی شد.", show_alert=True)
+        return
+    prompt = ("چند درصد تخفیف؟ (۱ تا ۱۰۰)" if kind == "percent"
+              else "مبلغ تخفیف ثابت چند تومان؟")
+    # carried as "d_kind": ask_state() itself has a "kind" parameter
+    # (the state kind), so a carried "kind" would collide with it
+    await ask_state(update, context, "a_disc_value", prompt,
+                    **_carry(st, d_kind=kind))
+
+
+async def _disc_wizard_first(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                             ans: str) -> None:
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "a_disc_first" or ans not in ("yes", "no"):
+        await update.callback_query.answer("منقضی شد.", show_alert=True)
+        return
+    carried = _carry(st, first_only=1 if ans == "yes" else 0)
+    if ans == "yes":
+        # first-only implies a first purchase: the scope is buy
+        carried["scope_kind"] = "buy"
+        await _disc_wizard_ask_panel(update, context, carried)
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 خرید", callback_data="adm_disc_scopekind:buy"),
+         InlineKeyboardButton("🔄 تمدید", callback_data="adm_disc_scopekind:renew")],
+        [InlineKeyboardButton("هر دو", callback_data="adm_disc_scopekind:all")],
+    ])
+    await ask_state(update, context, "a_disc_scopekind",
+                    "🛒 کد برای چه کاری باشه؟", extra_kb=kb, **carried)
+
+
+async def _disc_wizard_scopekind(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 scope: str) -> None:
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "a_disc_scopekind" or scope not in ("buy", "renew", "all"):
+        await update.callback_query.answer("منقضی شد.", show_alert=True)
+        return
+    await _disc_wizard_ask_panel(update, context,
+                                 _carry(st, scope_kind=scope))
+
+
+async def _disc_wizard_ask_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 carried: dict) -> None:
+    panels = await db.list_panels(True)
+    rows = [[InlineKeyboardButton(f"🌐 {p['name']}",
+                                  callback_data=f"adm_disc_panel:{p['id']}")]
+            for p in panels]
+    rows.append([InlineKeyboardButton("🌐 همه سرورها",
+                                      callback_data="adm_disc_panel:all")])
+    await ask_state(update, context, "a_disc_panel",
+                    "🌐 کد برای کدوم سرور باشه؟",
+                    extra_kb=InlineKeyboardMarkup(rows), **carried)
+
+
+async def _disc_wizard_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                             pid_s: str) -> None:
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "a_disc_panel":
+        await update.callback_query.answer("منقضی شد.", show_alert=True)
+        return
+    carried = _carry(st, scope_panel=None if pid_s == "all" else int(pid_s))
+    plans = await db.list_plans(True)
+    rows = [[InlineKeyboardButton(f"📦 {p['name']}",
+                                  callback_data=f"adm_disc_plan:{p['id']}")]
+            for p in plans]
+    rows.append([InlineKeyboardButton("📦 همه پلن‌ها",
+                                      callback_data="adm_disc_plan:all")])
+    await ask_state(update, context, "a_disc_plan",
+                    "📦 کد برای کدوم پلن باشه؟",
+                    extra_kb=InlineKeyboardMarkup(rows), **carried)
+
+
+async def _disc_wizard_plan(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            pid_s: str) -> None:
+    st = context.user_data.get("st") or {}
+    if st.get("k") != "a_disc_plan":
+        await update.callback_query.answer("منقضی شد.", show_alert=True)
+        return
+    carried = _carry(st, scope_plan=None if pid_s == "all" else int(pid_s))
+    await ask_state(update, context, "a_disc_expiry",
+                    "⏳ کد چند ساعت فعال باشه؟\nصفر یعنی نامحدود.", **carried)
 
 
 # ---------------- state machine (admin text/media input) ----------------
@@ -1570,6 +1815,126 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 pass
             await msg.reply_text(
                 f"✅ موجودی کاربر {st['tgid']} به {T.fmt_price(new_bal)} رسید.")
+        elif k == "a_disc_code":
+            code = db.normalize_discount_code(txt)
+            if not code or not re.fullmatch(r"[A-Z0-9]+", code):
+                await msg.reply_text(
+                    "❌ کد فقط حروف و عدد انگلیسی باشه (بدون فاصله) — دوباره بفرست:")
+                return True
+            if await db.get_discount_code(code):
+                await msg.reply_text(
+                    f"❌ کد «{code}» قبلاً ساخته شده — یه کد دیگه بفرست:")
+                return True
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("٪ درصدی",
+                                      callback_data="adm_disc_kind:percent"),
+                 InlineKeyboardButton("💰 مبلغ ثابت",
+                                      callback_data="adm_disc_kind:fixed")]])
+            await ask_state(update, context, "a_disc_kind",
+                            "🎁 نوع کد تخفیف چیه؟", extra_kb=kb, code=code)
+        elif k == "a_disc_value":
+            n = _num(txt)
+            kind = st.get("d_kind")
+            if kind == "percent":
+                if n is None or not 1 <= n <= 100:
+                    await msg.reply_text(
+                        "❌ درصد باید بین ۱ تا ۱۰۰ باشه — دوباره بفرست:")
+                    return True
+            elif n is None or n <= 0:
+                await msg.reply_text(
+                    "❌ مبلغ باید بیشتر از صفر باشه — دوباره بفرست:")
+                return True
+            await ask_state(update, context, "a_disc_limit_total",
+                            "📊 سقف مصرف کل چندتا باشه؟\nصفر یعنی نامحدود.",
+                            **_carry(st, value=n))
+        elif k == "a_disc_limit_total":
+            n = _num(txt)
+            if n is None or n < 0:
+                await msg.reply_text("❌ یه عدد بفرست — صفر یعنی نامحدود:")
+                return True
+            await ask_state(update, context, "a_disc_limit_user",
+                            "👤 سقف مصرف هر کاربر چندتا باشه؟\n(خالی یعنی ۱)",
+                            **_carry(st, limit_total=n))
+        elif k == "a_disc_limit_user":
+            if txt == "":
+                n = 1
+            else:
+                n = _num(txt)
+                if n is None or n < 1:
+                    await msg.reply_text(
+                        "❌ سقف هر کاربر باید حداقل ۱ باشه — دوباره بفرست:")
+                    return True
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ بله، فقط خرید اول",
+                                      callback_data="adm_disc_first:yes"),
+                 InlineKeyboardButton("❌ نه، همه خریدها",
+                                      callback_data="adm_disc_first:no")]])
+            await ask_state(update, context, "a_disc_first",
+                            "🆕 کد فقط برای خرید اول باشه؟", extra_kb=kb,
+                            **_carry(st, limit_per_user=n))
+        elif k == "a_disc_expiry":
+            n = _num(txt)
+            if n is None or n < 0:
+                await msg.reply_text("❌ یه عدد بفرست — صفر یعنی نامحدود:")
+                return True
+            expires_at = int(time.time()) + n * 3600 if n else None
+            try:
+                cid = await db.create_discount_code(
+                    st["code"], st.get("d_kind", "percent"), st["value"],
+                    limit_total=st.get("limit_total", 0),
+                    limit_per_user=st.get("limit_per_user", 1),
+                    first_only=bool(st.get("first_only")),
+                    scope_plan=st.get("scope_plan"),
+                    scope_panel=st.get("scope_panel"),
+                    scope_kind=st.get("scope_kind", "all"),
+                    expires_at=expires_at)
+            except ValueError as e:
+                await msg.reply_text(f"⚠️ ساخت کد نشد: {e}")
+                context.user_data.pop("st", None)
+                return True
+            context.user_data.pop("st", None)
+            row = await db.get_discount_code_by_id(cid)
+            await msg.reply_text("✅ کد تخفیف ساخته شد:\n"
+                                 + await _disc_text(row))
+        elif k == "a_gift_code":
+            code = db.normalize_discount_code(txt)
+            if not code or not re.fullmatch(r"[A-Z0-9]+", code):
+                await msg.reply_text(
+                    "❌ کد فقط حروف و عدد انگلیسی باشه (بدون فاصله) — دوباره بفرست:")
+                return True
+            if await db.get_gift_code(code):
+                await msg.reply_text(
+                    f"❌ کد «{code}» قبلاً ساخته شده — یه کد دیگه بفرست:")
+                return True
+            await ask_state(update, context, "a_gift_amount",
+                            "💰 مبلغ هدیه چند تومان؟", code=code)
+        elif k == "a_gift_amount":
+            n = _num(txt)
+            if n is None or n <= 0:
+                await msg.reply_text(
+                    "❌ مبلغ باید بیشتر از صفر باشه — دوباره بفرست:")
+                return True
+            await ask_state(update, context, "a_gift_limit",
+                            "📊 سقف مصرف کل چندتا باشه؟\nصفر یعنی نامحدود.",
+                            **_carry(st, amount=n))
+        elif k == "a_gift_limit":
+            n = _num(txt)
+            if n is None or n < 0:
+                await msg.reply_text("❌ یه عدد بفرست — صفر یعنی نامحدود:")
+                return True
+            try:
+                cid = await db.create_gift_code(st["code"], st["amount"],
+                                                limit_total=n)
+            except ValueError as e:
+                await msg.reply_text(f"⚠️ ساخت کد نشد: {e}")
+                context.user_data.pop("st", None)
+                return True
+            context.user_data.pop("st", None)
+            row = await db.get_gift_code_by_id(cid)
+            await msg.reply_text(
+                f"✅ کد هدیه ساخته شد:\n🎁 کد: {row['code']}\n"
+                f"💰 مبلغ: {row['amount']:,} تومان\n"
+                f"📊 سقف کل: {'نامحدود' if not row['limit_total'] else f'{row['limit_total']:,}'}")
         elif k.startswith("a_setup_"):
             await _setup_answer(update, context, st, k[len("a_setup_"):], txt)
         else:
@@ -1806,6 +2171,70 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await ask_state(update, context, "a_setkey",
                             f"{SETTING_LABELS.get(key, key)}؟\nفعلی: {shown or '—'}",
                             key=key)
+        # discount codes
+        elif data == "adm_disc_home":
+            await discounts_menu(update, context)
+        elif data == "adm_disc_add":
+            if not await _can_create_discount(q.from_user.id):
+                await q.answer("⛔ ساخت کد فقط برای مالکه.", show_alert=True)
+            else:
+                await ask_state(
+                    update, context, "a_disc_code",
+                    "🎁 متن کد تخفیف رو بفرست:\n"
+                    "فقط حروف و عدد انگلیسی، بدون فاصله — مثلاً `WELCOME20`")
+        elif data == "adm_disc_gift_add":
+            if not await _can_create_discount(q.from_user.id):
+                await q.answer("⛔ ساخت کد فقط برای مالکه.", show_alert=True)
+            else:
+                await ask_state(
+                    update, context, "a_gift_code",
+                    "🎁 متن کد هدیه رو بفرست:\n"
+                    "فقط حروف و عدد انگلیسی، بدون فاصله — مثلاً `GIFT50`")
+        elif data == "adm_disc_list":
+            await discounts_list(update, context)
+        elif data == "adm_disc_gift_list":
+            await gift_codes_list(update, context)
+        elif data == "adm_disc_who":
+            if not config.is_owner(q.from_user.id):
+                await q.answer(T.NEED_ADMIN, show_alert=True)
+            else:
+                cur = await db.get_setting("discount_create_by", "owner")
+                await db.set_setting(
+                    "discount_create_by",
+                    "admins" if cur == "owner" else "owner")
+                await discounts_menu(update, context)
+        elif data.startswith("adm_disc_view:"):
+            await discount_detail(update, context, int(parts[1]))
+        elif data.startswith("adm_disc_toggle:"):
+            c = await db.get_discount_code_by_id(int(parts[1]))
+            if c:
+                await db.set_discount_active(c["id"], not c["active"])
+            await discount_detail(update, context, int(parts[1]))
+        elif data.startswith("adm_disc_del:"):
+            await db.delete_discount_code(int(parts[1]))
+            await q.answer("حذف شد.")
+            await discounts_list(update, context)
+        elif data.startswith("adm_gift_view:"):
+            await gift_detail(update, context, int(parts[1]))
+        elif data.startswith("adm_gift_toggle:"):
+            c = await db.get_gift_code_by_id(int(parts[1]))
+            if c:
+                await db.set_gift_active(c["id"], not c["active"])
+            await gift_detail(update, context, int(parts[1]))
+        elif data.startswith("adm_gift_del:"):
+            await db.delete_gift_code(int(parts[1]))
+            await q.answer("حذف شد.")
+            await gift_codes_list(update, context)
+        elif data.startswith("adm_disc_kind:"):
+            await _disc_wizard_kind(update, context, parts[1])
+        elif data.startswith("adm_disc_first:"):
+            await _disc_wizard_first(update, context, parts[1])
+        elif data.startswith("adm_disc_scopekind:"):
+            await _disc_wizard_scopekind(update, context, parts[1])
+        elif data.startswith("adm_disc_panel:"):
+            await _disc_wizard_panel(update, context, parts[1])
+        elif data.startswith("adm_disc_plan:"):
+            await _disc_wizard_plan(update, context, parts[1])
         # setup guide
         elif data == "adm_setup_start":
             await _setup_start(update, context)

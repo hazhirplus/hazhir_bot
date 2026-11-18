@@ -39,6 +39,12 @@ def is_admin(tg_id: int | None) -> bool:
     return bool(tg_id) and tg_id in ADMIN_IDS
 
 
+def is_owner(tg_id: int | None) -> bool:
+    """The owner is the first ADMIN_IDS entry (same convention as the
+    nightly backup, which only goes to the owner)."""
+    return bool(tg_id) and bool(ADMIN_IDS) and tg_id == ADMIN_IDS[0]
+
+
 def mask_token(token: str) -> str:
     """Show only last 4 chars of a secret."""
     if not token:

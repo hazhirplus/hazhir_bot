@@ -538,7 +538,7 @@ def test_admin_sections_tidy():
     assert all(len(r) <= 2 for r in rows)
     assert rows[-1] == ["🔙 منوی اصلی"]
     flat = [b for r in rows for b in r]
-    assert len(flat) == 12  # 11 sections + back
+    assert len(flat) == 13  # 12 sections + back
     assert "📖 آموزش راه‌اندازی" in flat
 
 

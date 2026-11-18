@@ -80,6 +80,46 @@ CREATE TABLE IF NOT EXISTS referrals(
     gifted_at INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS discount_codes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,           -- normalized (UPPER, no spaces)
+    kind TEXT NOT NULL DEFAULT 'percent', -- 'percent' | 'fixed'
+    value INTEGER NOT NULL,               -- percent 1..100 | fixed toman
+    limit_total INTEGER NOT NULL DEFAULT 0, -- 0 = unlimited
+    used_total INTEGER NOT NULL DEFAULT 0,
+    limit_per_user INTEGER NOT NULL DEFAULT 1,
+    first_only INTEGER NOT NULL DEFAULT 0,
+    scope_plan INTEGER,                   -- NULL = all plans
+    scope_panel INTEGER,                  -- NULL = all panels
+    scope_kind TEXT NOT NULL DEFAULT 'all', -- 'buy' | 'renew' | 'all'
+    expires_at INTEGER,                   -- unix, NULL = unlimited
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discount_uses(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    invoice_id INTEGER,
+    used_at INTEGER NOT NULL,
+    UNIQUE(code_id, user_id, invoice_id)
+);
+CREATE TABLE IF NOT EXISTS gift_codes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,            -- normalized (UPPER, no spaces)
+    amount INTEGER NOT NULL,              -- fixed toman credited to wallet
+    limit_total INTEGER NOT NULL DEFAULT 0, -- 0 = unlimited
+    used_total INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gift_code_uses(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,             -- each user takes a gift code once
+    used_at INTEGER NOT NULL,
+    UNIQUE(code_id, user_id)
+);
 """
 
 
@@ -101,6 +141,8 @@ async def init_db(path: str | None = None) -> None:
             ("invoices", "crypto_tx", "TEXT DEFAULT ''"),
             ("invoices", "crypto_meta", "TEXT DEFAULT ''"),
             ("invoices", "volume_warned_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("invoices", "discount_code", "TEXT DEFAULT ''"),
+            ("invoices", "price_before", "INTEGER NOT NULL DEFAULT 0"),
         ):
             cur = await con.execute(f"PRAGMA table_info({table})")
             have = [r[1] for r in await cur.fetchall()]
@@ -134,6 +176,7 @@ async def seed_from_env(path: str | None = None) -> None:
             "ref_gift_days": "30",
             # crypto rail (v2.3): disabled until the owner enables it in settings
             "crypto_enabled": "0",
+            "discount_create_by": "owner",
             "evm_address": config.EVM_ADDRESS,
             "etherscan_key": config.ETHERSCAN_API_KEY,
             "crypto_expiry_min": "90",
@@ -486,7 +529,7 @@ async def list_invoices(status: str | None = None, kind: str | None = None,
 async def update_invoice(iid: int, path: str | None = None, **fields) -> None:
     allowed = {"kind", "plan_id", "panel_id", "panel_email", "sub_id", "price_toman",
                "status", "receipt_file_id", "activated_at", "expires_at", "warned_at",
-               "volume_warned_at",
+               "volume_warned_at", "discount_code", "price_before",
                "pay_method", "crypto_chain", "crypto_currency", "crypto_amount",
                "crypto_address", "crypto_expires_at", "crypto_tx", "crypto_meta"}
     sets, vals = [], []
@@ -904,3 +947,416 @@ async def count_paid_purchases(tg_id: int, path: str | None = None) -> int:
             (tg_id,),
         )
         return (await cur.fetchone())[0]
+
+# ---------------- discount codes ----------------
+# Two mechanisms, kept separate like mirzabot: a discount code cuts the
+# price of a purchase/renew, a gift code credits a fixed amount to the
+# wallet. Codes are normalized to UPPER with no spaces, at creation AND
+# at entry (mirzabot only lowercased at creation and relied on the DB
+# collation at entry).
+
+DISCOUNT_ERRORS = ("not_found", "inactive", "expired", "limit_total",
+                   "limit_per_user", "first_only", "scope_plan",
+                   "scope_panel", "scope_kind")
+
+
+def normalize_discount_code(code: str) -> str:
+    """UPPER + strip all whitespace (mirzabot lowercases at creation
+    only; normalizing both sides avoids collation surprises)."""
+    return "".join(str(code or "").split()).upper()
+
+
+def calc_discounted_price(kind: str, value: int, price: int) -> int:
+    """Final price after a discount, floored at 0 (mirzabot rounds the
+    percent cut; integer toman math keeps it exact here)."""
+    price = max(0, int(price))
+    if kind == "percent":
+        cut = round(price * int(value) / 100)
+    else:  # fixed
+        cut = int(value)
+    return max(0, price - cut)
+
+
+def _discount_row(r) -> dict:
+    return dict(r)
+
+
+async def create_discount_code(code: str, kind: str, value: int,
+                               limit_total: int = 0, limit_per_user: int = 1,
+                               first_only: bool = False,
+                               scope_plan: int | None = None,
+                               scope_panel: int | None = None,
+                               scope_kind: str = "all",
+                               expires_at: int | None = None,
+                               path: str | None = None) -> int:
+    """Insert a discount code. Raises ValueError on bad input or a
+    duplicate code (the per-user limit can never be NULL — mirzabot's
+    API let a NULL useuser through and the code then rejected everyone).
+    """
+    code = normalize_discount_code(code)
+    if not code:
+        raise ValueError("empty code")
+    if kind not in ("percent", "fixed"):
+        raise ValueError("kind must be 'percent' or 'fixed'")
+    value = int(value)
+    if kind == "percent" and not 1 <= value <= 100:
+        raise ValueError("percent must be 1..100")
+    if kind == "fixed" and value <= 0:
+        raise ValueError("fixed amount must be positive")
+    limit_total = int(limit_total)
+    limit_per_user = int(limit_per_user)
+    if limit_total < 0 or limit_per_user < 1:
+        raise ValueError("bad limits")
+    if scope_kind not in ("buy", "renew", "all"):
+        raise ValueError("scope_kind must be 'buy', 'renew' or 'all'")
+    if scope_kind == "renew" and first_only:
+        raise ValueError("first-only codes cannot be renew-only")
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        try:
+            cur = await con.execute(
+                "INSERT INTO discount_codes(code,kind,value,limit_total,"
+                " limit_per_user,first_only,scope_plan,scope_panel,"
+                " scope_kind,expires_at,active,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,1,?)",
+                (code, kind, value, limit_total, limit_per_user,
+                 1 if first_only else 0, scope_plan, scope_panel,
+                 scope_kind, expires_at, int(time.time())),
+            )
+        except Exception as e:
+            # UNIQUE violation on code -> duplicate
+            raise ValueError("duplicate code") from e
+        await con.commit()
+        return cur.lastrowid
+
+
+async def get_discount_code(code: str, path: str | None = None):
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute(
+            "SELECT * FROM discount_codes WHERE code=?",
+            (normalize_discount_code(code),))
+        row = await cur.fetchone()
+        return _discount_row(row) if row else None
+
+
+async def get_discount_code_by_id(cid: int, path: str | None = None):
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute(
+            "SELECT * FROM discount_codes WHERE id=?", (cid,))
+        row = await cur.fetchone()
+        return _discount_row(row) if row else None
+
+
+async def list_discount_codes(path: str | None = None) -> list[dict]:
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute(
+            "SELECT * FROM discount_codes ORDER BY id DESC")
+        return [_discount_row(r) for r in await cur.fetchall()]
+
+
+async def set_discount_active(cid: int, active: bool,
+                              path: str | None = None) -> None:
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        await con.execute(
+            "UPDATE discount_codes SET active=? WHERE id=?",
+            (1 if active else 0, cid))
+        await con.commit()
+
+
+async def delete_discount_code(cid: int, path: str | None = None) -> None:
+    """Delete a code and its recorded uses (past invoices keep their
+    discount_code text — history is not rewritten)."""
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        await con.execute("DELETE FROM discount_uses WHERE code_id=?", (cid,))
+        await con.execute("DELETE FROM discount_codes WHERE id=?", (cid,))
+        await con.commit()
+
+
+async def count_discount_uses(code_id: int, user_id: int | None = None,
+                              path: str | None = None) -> int:
+    path = path or config.DB_PATH
+    q = "SELECT COUNT(*) FROM discount_uses WHERE code_id=?"
+    vals: list = [code_id]
+    if user_id is not None:
+        q += " AND user_id=?"
+        vals.append(user_id)
+    async with aiosqlite.connect(path) as con:
+        cur = await con.execute(q, vals)
+        return (await cur.fetchone())[0]
+
+
+async def validate_discount(code: str, user_id: int, *, plan_id: int | None = None,
+                            panel_id: int | None = None, kind: str = "buy",
+                            price: int = 0, path: str | None = None):
+    """Shared validation, mirzabot check order: exists -> active ->
+    expired -> limit_total -> limit_per_user -> first_only -> scope
+    plan/panel -> buy/renew kind. Returns (ok, row, error_key,
+    final_price): row is None when not found, final_price is None on
+    failure. Callers re-run this at confirm time (time passes between
+    code entry and payment) and rely on consume_discount_code's atomic
+    guard for the final word on limits.
+    """
+    row = await get_discount_code(code, path)
+    if not row:
+        return False, None, "not_found", None
+    now = int(time.time())
+    if not row["active"]:
+        return False, row, "inactive", None
+    if row["expires_at"] and now >= row["expires_at"]:
+        return False, row, "expired", None
+    if row["limit_total"] and row["used_total"] >= row["limit_total"]:
+        return False, row, "limit_total", None
+    if await count_discount_uses(row["id"], user_id, path) >= row["limit_per_user"]:
+        return False, row, "limit_per_user", None
+    if row["first_only"] and await count_paid_purchases(user_id, path) > 0:
+        return False, row, "first_only", None
+    if row["scope_plan"] is not None and plan_id is not None \
+            and row["scope_plan"] != plan_id:
+        return False, row, "scope_plan", None
+    if row["scope_panel"] is not None and panel_id is not None \
+            and row["scope_panel"] != panel_id:
+        return False, row, "scope_panel", None
+    if row["scope_kind"] != "all" and row["scope_kind"] != kind:
+        return False, row, "scope_kind", None
+    return True, row, None, calc_discounted_price(
+        row["kind"], row["value"], price)
+
+
+async def consume_discount_code(code_id: int, user_id: int,
+                                invoice_id: int | None = None,
+                                path: str | None = None) -> bool:
+    """Atomically record one use of a code (mirzabot's consumeDiscountCode,
+    same single-transaction pattern as debit_balance). The total and
+    per-user limits are re-checked inside a BEGIN IMMEDIATE transaction,
+    so two concurrent consumes of the last use cannot both win. Returns
+    False when the code is gone, inactive, or the user hit their limit.
+    """
+    path = path or config.DB_PATH
+    now = int(time.time())
+    async with aiosqlite.connect(path) as con:
+        await con.execute("BEGIN IMMEDIATE")
+        try:
+            con.row_factory = aiosqlite.Row
+            cur = await con.execute(
+                "SELECT * FROM discount_codes WHERE id=?", (code_id,))
+            row = await cur.fetchone()
+            if not row or not row["active"]:
+                await con.rollback()
+                return False
+            if row["expires_at"] and now >= row["expires_at"]:
+                await con.rollback()
+                return False
+            if row["limit_total"] and row["used_total"] >= row["limit_total"]:
+                await con.rollback()
+                return False
+            cur = await con.execute(
+                "SELECT COUNT(*) FROM discount_uses WHERE code_id=? AND user_id=?",
+                (code_id, user_id))
+            if (await cur.fetchone())[0] >= row["limit_per_user"]:
+                await con.rollback()
+                return False
+            cur = await con.execute(
+                "UPDATE discount_codes SET used_total = used_total + 1"
+                " WHERE id=? AND (limit_total=0 OR used_total < limit_total)",
+                (code_id,))
+            if cur.rowcount != 1:
+                await con.rollback()
+                return False
+            await con.execute(
+                "INSERT INTO discount_uses(code_id,user_id,invoice_id,used_at)"
+                " VALUES(?,?,?,?)",
+                (code_id, user_id, invoice_id, now))
+            await con.commit()
+            return True
+        except Exception:
+            await con.rollback()
+            raise
+
+
+async def release_discount_code(code_id: int, user_id: int,
+                                invoice_id: int | None = None,
+                                path: str | None = None) -> bool:
+    """Undo one recorded use: drop the use row and decrement the
+    counter (never below 0). Returns False when no matching use exists.
+    """
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        await con.execute("BEGIN IMMEDIATE")
+        try:
+            if invoice_id is not None:
+                cur = await con.execute(
+                    "SELECT id FROM discount_uses WHERE code_id=? AND user_id=?"
+                    " AND invoice_id=? LIMIT 1",
+                    (code_id, user_id, invoice_id))
+            else:
+                cur = await con.execute(
+                    "SELECT id FROM discount_uses WHERE code_id=? AND user_id=?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (code_id, user_id))
+            row = await cur.fetchone()
+            if not row:
+                await con.rollback()
+                return False
+            await con.execute(
+                "DELETE FROM discount_uses WHERE id=?", (row[0],))
+            await con.execute(
+                "UPDATE discount_codes SET used_total = MAX(0, used_total - 1)"
+                " WHERE id=?",
+                (code_id,))
+            await con.commit()
+            return True
+        except Exception:
+            await con.rollback()
+            raise
+
+
+async def release_discount_for_invoice(invoice_id: int,
+                                       path: str | None = None) -> bool:
+    """Release the code recorded on an invoice (admin reject, service
+    removal, failed wallet buy/renew). No-op when the invoice has none.
+    """
+    inv = await get_invoice(invoice_id, path)
+    if not inv or not inv.get("discount_code"):
+        return False
+    row = await get_discount_code(inv["discount_code"], path)
+    if not row:
+        return False
+    return await release_discount_code(row["id"], inv["user_id"],
+                                       invoice_id, path)
+
+
+# ---------------- gift codes ----------------
+async def create_gift_code(code: str, amount: int, limit_total: int = 0,
+                           path: str | None = None) -> int:
+    """A gift code credits a fixed toman amount to the wallet. Raises
+    ValueError on bad input or a duplicate code."""
+    code = normalize_discount_code(code)
+    if not code:
+        raise ValueError("empty code")
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    limit_total = int(limit_total)
+    if limit_total < 0:
+        raise ValueError("bad limit")
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        try:
+            cur = await con.execute(
+                "INSERT INTO gift_codes(code,amount,limit_total,used_total,"
+                " active,created_at) VALUES(?,?,?,?,1,?)",
+                (code, amount, limit_total, 0, int(time.time())),
+            )
+        except Exception as e:
+            raise ValueError("duplicate code") from e
+        await con.commit()
+        return cur.lastrowid
+
+
+async def get_gift_code(code: str, path: str | None = None):
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute(
+            "SELECT * FROM gift_codes WHERE code=?",
+            (normalize_discount_code(code),))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_gift_code_by_id(cid: int, path: str | None = None):
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute("SELECT * FROM gift_codes WHERE id=?", (cid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def list_gift_codes(path: str | None = None) -> list[dict]:
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        con.row_factory = aiosqlite.Row
+        cur = await con.execute("SELECT * FROM gift_codes ORDER BY id DESC")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def set_gift_active(cid: int, active: bool, path: str | None = None) -> None:
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        await con.execute("UPDATE gift_codes SET active=? WHERE id=?",
+                          (1 if active else 0, cid))
+        await con.commit()
+
+
+async def delete_gift_code(cid: int, path: str | None = None) -> None:
+    path = path or config.DB_PATH
+    async with aiosqlite.connect(path) as con:
+        await con.execute("DELETE FROM gift_code_uses WHERE code_id=?", (cid,))
+        await con.execute("DELETE FROM gift_codes WHERE id=?", (cid,))
+        await con.commit()
+
+
+async def redeem_gift_code(code: str, user_id: int,
+                           path: str | None = None):
+    """Atomically redeem a gift code: one use per user, total-limit
+    guarded, wallet credited in the same transaction. Returns
+    (ok, amount, error_key): error_key in not_found/inactive/
+    limit_total/already_used.
+    """
+    code = normalize_discount_code(code)
+    path = path or config.DB_PATH
+    now = int(time.time())
+    async with aiosqlite.connect(path) as con:
+        await con.execute("BEGIN IMMEDIATE")
+        try:
+            con.row_factory = aiosqlite.Row
+            cur = await con.execute(
+                "SELECT * FROM gift_codes WHERE code=?", (code,))
+            row = await cur.fetchone()
+            if not row:
+                await con.rollback()
+                return False, None, "not_found"
+            if not row["active"]:
+                await con.rollback()
+                return False, None, "inactive"
+            if row["limit_total"] and row["used_total"] >= row["limit_total"]:
+                await con.rollback()
+                return False, None, "limit_total"
+            cur = await con.execute(
+                "SELECT COUNT(*) FROM gift_code_uses WHERE code_id=? AND user_id=?",
+                (row["id"], user_id))
+            if (await cur.fetchone())[0] > 0:
+                await con.rollback()
+                return False, None, "already_used"
+            cur = await con.execute(
+                "UPDATE gift_codes SET used_total = used_total + 1"
+                " WHERE id=? AND (limit_total=0 OR used_total < limit_total)",
+                (row["id"],))
+            if cur.rowcount != 1:
+                await con.rollback()
+                return False, None, "limit_total"
+            await con.execute(
+                "INSERT INTO gift_code_uses(code_id,user_id,used_at)"
+                " VALUES(?,?,?)",
+                (row["id"], user_id, now))
+            await con.execute(
+                "INSERT INTO users(tg_id, username, joined, balance_toman)"
+                " VALUES(?,?,?,?)"
+                " ON CONFLICT(tg_id) DO UPDATE SET"
+                " balance_toman = users.balance_toman + excluded.balance_toman",
+                (user_id, "", now, int(row["amount"])),
+            )
+            await con.commit()
+            return True, int(row["amount"]), None
+        except Exception:
+            await con.rollback()
+            raise

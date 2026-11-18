@@ -23,6 +23,7 @@ def admin_sections() -> ReplyKeyboardMarkup:
          ["📦 پلن‌ها", "💳 کارت‌ها"],
          ["👥 کاربران", "📚 آموزش‌ها"],
          ["📢 پیام همگانی", "⚙️ تنظیمات"],
+         ["🎁 کدهای تخفیف"],
          ["📖 آموزش راه‌اندازی"],
          ["🔙 منوی اصلی"]],
         resize_keyboard=True,
@@ -69,16 +70,22 @@ def panels_kb(panels: list[dict]) -> InlineKeyboardMarkup:
 
 
 def buy_kb(plan_id: int, wallet_ok: bool = False, balance: int = 0,
-           crypto_ok: bool = False) -> InlineKeyboardMarkup:
+           crypto_ok: bool = False, discount_applied: bool = False) -> InlineKeyboardMarkup:
+    """Plan-detail payment buttons. With a discount applied the crypto
+    button is hidden: the crypto amount is quoted from the full plan
+    price and the discount cannot be priced into it."""
     rows = []
     if wallet_ok:
         rows.append([InlineKeyboardButton(
             f"👜 پرداخت با کیف پول ({balance:,} تومان)",
             callback_data=f"u:walletbuy:{plan_id}")])
-    if crypto_ok:
+    if crypto_ok and not discount_applied:
         rows.append([InlineKeyboardButton(
             "💎 ارز دیجیتال", callback_data=f"u:cryptobuy:{plan_id}")])
     rows.append([InlineKeyboardButton("💳 کارت‌به‌کارت", callback_data=f"u:buy:{plan_id}")])
+    if not discount_applied:
+        rows.append([InlineKeyboardButton("🎁 کد تخفیف",
+                                          callback_data=f"u:discount:{plan_id}")])
     rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="u:plans")])
     return InlineKeyboardMarkup(rows)
 
